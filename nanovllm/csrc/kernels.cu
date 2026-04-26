@@ -13,6 +13,11 @@
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr int kQwen3KvHeads = 8;
+constexpr int kQwen3HeadDim = 128;
+constexpr int kQwen3KvWidth = kQwen3KvHeads * kQwen3HeadDim;
+constexpr int kQwen3KvVecElems = sizeof(uint4) / sizeof(c10::BFloat16);
+constexpr int kQwen3KvWidthVec = kQwen3KvWidth / kQwen3KvVecElems;
 
 inline void check_cuda(const torch::Tensor &t, const char *name) {
   TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
@@ -189,22 +194,18 @@ __global__ void rotary_one_kernel(const int64_t *__restrict__ positions,
   }
 }
 
-template <typename scalar_t>
-__global__ void store_kvcache_kernel(const scalar_t *__restrict__ key,
-                                     const scalar_t *__restrict__ value,
-                                     scalar_t *__restrict__ k_cache,
-                                     scalar_t *__restrict__ v_cache,
-                                     const int32_t *__restrict__ slot_mapping,
-                                     int width, int64_t kv_stride0) {
+__global__ void store_kvcache_vec_kernel(
+    const uint4 *__restrict__ key, const uint4 *__restrict__ value,
+    uint4 *__restrict__ k_cache, uint4 *__restrict__ v_cache,
+    const int32_t *__restrict__ slot_mapping, int64_t kv_stride0_vec) {
   int token = blockIdx.x;
   int col = threadIdx.x;
   int slot = slot_mapping[token];
-  if (slot < 0) {
+  if (slot < 0)
     return;
-  }
-  int64_t src = static_cast<int64_t>(token) * kv_stride0;
-  int64_t dst = static_cast<int64_t>(slot) * width;
-  for (int i = col; i < width; i += blockDim.x) {
+  int64_t src = static_cast<int64_t>(token) * kv_stride0_vec;
+  int64_t dst = static_cast<int64_t>(slot) * kQwen3KvWidthVec;
+  for (int i = col; i < kQwen3KvWidthVec; i += blockDim.x) {
     k_cache[dst + i] = key[src + i];
     v_cache[dst + i] = value[src + i];
   }
@@ -382,12 +383,14 @@ void store_kvcache(torch::Tensor key, torch::Tensor value,
   check_cuda(v_cache, "v_cache");
   check_cuda(slot_mapping, "slot_mapping");
   TORCH_CHECK(key.sizes() == value.sizes(), "key/value shape mismatch");
-  TORCH_CHECK(key.scalar_type() == value.scalar_type(),
-              "key/value dtype mismatch");
-  TORCH_CHECK(key.scalar_type() == k_cache.scalar_type() &&
-                  key.scalar_type() == v_cache.scalar_type(),
-              "KV cache dtype mismatch");
-  TORCH_CHECK(key.dim() == 3, "key/value must be [tokens, heads, head_dim]");
+  TORCH_CHECK(key.scalar_type() == torch::kBFloat16 &&
+                  value.scalar_type() == torch::kBFloat16 &&
+                  k_cache.scalar_type() == torch::kBFloat16 &&
+                  v_cache.scalar_type() == torch::kBFloat16,
+              "Qwen3 KV store only supports bfloat16");
+  TORCH_CHECK(key.dim() == 3 && key.size(1) == kQwen3KvHeads &&
+                  key.size(2) == kQwen3HeadDim,
+              "Qwen3 KV store expects key/value [tokens, 8, 128]");
   TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous(),
               "KV cache tensors must be contiguous");
   TORCH_CHECK(slot_mapping.is_contiguous(), "slot_mapping must be contiguous");
@@ -398,31 +401,30 @@ void store_kvcache(torch::Tensor key, torch::Tensor value,
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
   int tokens = static_cast<int>(key.size(0));
-  int heads = static_cast<int>(key.size(1));
-  int head_dim = static_cast<int>(key.size(2));
-  int width = heads * head_dim;
-  TORCH_CHECK(key.stride(1) == head_dim && key.stride(2) == 1,
+  TORCH_CHECK(key.stride(1) == kQwen3HeadDim && key.stride(2) == 1,
               "key inner layout must be contiguous");
-  TORCH_CHECK(value.stride(1) == head_dim && value.stride(2) == 1,
+  TORCH_CHECK(value.stride(1) == kQwen3HeadDim && value.stride(2) == 1,
               "value inner layout must be contiguous");
   TORCH_CHECK(key.stride(0) == value.stride(0),
               "key/value token stride mismatch");
+  TORCH_CHECK(key.stride(0) % kQwen3KvVecElems == 0,
+              "key/value token stride must be 16-byte aligned");
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
               "KV cache must be [blocks, block_size, heads, head_dim]");
-  TORCH_CHECK(k_cache.size(2) == heads && k_cache.size(3) == head_dim,
+  TORCH_CHECK(k_cache.size(2) == kQwen3KvHeads &&
+                  k_cache.size(3) == kQwen3HeadDim,
               "k_cache shape mismatch");
-  TORCH_CHECK(v_cache.size(2) == heads && v_cache.size(3) == head_dim,
+  TORCH_CHECK(v_cache.size(2) == kQwen3KvHeads &&
+                  v_cache.size(3) == kQwen3HeadDim,
               "v_cache shape mismatch");
   auto stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      torch::kHalf, torch::kBFloat16, key.scalar_type(), "store_kvcache_cuda",
-      [&] {
-        dim3 block(kBlockSize);
-        dim3 grid(tokens);
-        store_kvcache_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            key.data_ptr<scalar_t>(), value.data_ptr<scalar_t>(),
-            k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
-            slot_mapping.data_ptr<int32_t>(), width, key.stride(0));
-      });
+  dim3 block(kBlockSize);
+  dim3 grid(tokens);
+  store_kvcache_vec_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const uint4 *>(key.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<const uint4 *>(value.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<uint4 *>(k_cache.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<uint4 *>(v_cache.data_ptr<c10::BFloat16>()),
+      slot_mapping.data_ptr<int32_t>(), key.stride(0) / kQwen3KvVecElems);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

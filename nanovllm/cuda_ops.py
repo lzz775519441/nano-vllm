@@ -143,37 +143,8 @@ def store_kvcache(
     slot_mapping: torch.Tensor,
 ) -> None:
     if USE_CUDA_KVSTORE and _usable_cuda(key, value, k_cache, v_cache, slot_mapping):
-        key_inner_contiguous = key.stride(1) == key.size(2) and key.stride(2) == 1
-        value_inner_contiguous = value.stride(1) == value.size(2) and value.stride(2) == 1
-        layout_ready = (
-            slot_mapping.is_contiguous()
-            and k_cache.is_contiguous()
-            and v_cache.is_contiguous()
-            and key_inner_contiguous
-            and value_inner_contiguous
-            and (USE_STRIDE_AWARE_KERNELS or (key.is_contiguous() and value.is_contiguous()))
-        )
-        if layout_ready:
-            _C.store_kvcache(
-                key,
-                value,
-                k_cache,
-                v_cache,
-                slot_mapping,
-            )
-            return
-        if ALLOW_CONTIGUOUS_COPY and k_cache.is_contiguous() and v_cache.is_contiguous():
-            key = key.contiguous()
-            value = value.contiguous()
-            slot_mapping = slot_mapping.contiguous()
-            _C.store_kvcache(
-                key,
-                value,
-                k_cache,
-                v_cache,
-                slot_mapping,
-            )
-            return
+        _C.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
+        return
 
     valid = slot_mapping >= 0
     if not valid.any():
