@@ -1,3 +1,6 @@
+import os
+import random
+
 import torch
 
 try:
@@ -9,22 +12,68 @@ except ImportError:
 HAS_CUDA_OPS = _C is not None
 
 
-def _usable(*tensors: torch.Tensor) -> bool:
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in ("0", "false", "off", "no")
+
+
+USE_CUDA_SAMPLE = _env_flag("NANOVLLM_CUDA_SAMPLE")
+USE_CUDA_RMSNORM = _env_flag("NANOVLLM_CUDA_RMSNORM")
+USE_CUDA_ROPE = _env_flag("NANOVLLM_CUDA_ROPE")
+USE_CUDA_KVSTORE = _env_flag("NANOVLLM_CUDA_KVSTORE")
+USE_STRIDE_AWARE_KERNELS = _env_flag("NANOVLLM_CUDA_STRIDE_AWARE", False)
+
+# The current native kernels assume contiguous tensor layouts.  Keep this off
+# by default so the wrapper never hides an expensive copy behind a fast-looking
+# custom op call.  Turn it on only for A/B testing the old behavior.
+ALLOW_CONTIGUOUS_COPY = _env_flag("NANOVLLM_CUDA_ALLOW_CONTIGUOUS_COPY", False)
+
+
+def _usable_cuda(*tensors: torch.Tensor) -> bool:
     return HAS_CUDA_OPS and all(t.is_cuda for t in tensors)
 
 
+def _contiguous_or_none(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...] | None:
+    if not _usable_cuda(*tensors):
+        return None
+    if all(t.is_contiguous() for t in tensors):
+        return tensors
+    if ALLOW_CONTIGUOUS_COPY:
+        return tuple(t.contiguous() for t in tensors)
+    return None
+
+
+def _native_layout_ready(*tensors: torch.Tensor) -> bool:
+    return _usable_cuda(*tensors) and (USE_STRIDE_AWARE_KERNELS or all(t.is_contiguous() for t in tensors))
+
+
+def _stride3(tensor: torch.Tensor) -> tuple[int, int, int]:
+    return tensor.stride(0), tensor.stride(1), tensor.stride(2)
+
+
+def _next_seed() -> int:
+    return random.getrandbits(63)
+
+
 def sample(logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
-    if _usable(logits, temperatures):
-        seed = torch.empty((), dtype=torch.int64, device="cpu").random_().item()
-        return _C.sample(logits.contiguous(), temperatures.contiguous(), seed)
+    if USE_CUDA_SAMPLE:
+        native_tensors = _contiguous_or_none(logits, temperatures)
+        if native_tensors is not None:
+            logits, temperatures = native_tensors
+            return _C.sample(logits, temperatures, _next_seed())
     logits = logits.float().div_(temperatures.unsqueeze(dim=1))
     probs = torch.softmax(logits, dim=-1)
     return probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    if _usable(x, weight):
-        return _C.rms_norm(x.contiguous(), weight.contiguous(), eps)
+    if USE_CUDA_RMSNORM:
+        native_tensors = _contiguous_or_none(x, weight)
+        if native_tensors is not None:
+            x, weight = native_tensors
+            return _C.rms_norm(x, weight, eps)
     orig_dtype = x.dtype
     x = x.float()
     var = x.pow(2).mean(dim=-1, keepdim=True)
@@ -33,9 +82,12 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def add_rms_norm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if _usable(x, residual, weight):
-        out, new_residual = _C.add_rms_norm(x.contiguous(), residual.contiguous(), weight.contiguous(), eps)
-        return out, new_residual
+    if USE_CUDA_RMSNORM:
+        native_tensors = _contiguous_or_none(x, residual, weight)
+        if native_tensors is not None:
+            x, residual, weight = native_tensors
+            out, new_residual = _C.add_rms_norm(x, residual, weight, eps)
+            return out, new_residual
     orig_dtype = x.dtype
     x = x.float().add_(residual.float())
     residual = x.to(orig_dtype)
@@ -50,14 +102,29 @@ def rotary_embedding(
     key: torch.Tensor,
     cos_sin_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _usable(positions, query, key, cos_sin_cache):
-        q, k = _C.rotary_embedding(
-            positions.contiguous(),
-            query.contiguous(),
-            key.contiguous(),
-            cos_sin_cache.contiguous(),
-        )
-        return q, k
+    if USE_CUDA_ROPE and _usable_cuda(positions, query, key, cos_sin_cache):
+        if positions.is_contiguous() and cos_sin_cache.is_contiguous() and _native_layout_ready(query, key):
+            return _C.rotary_embedding(
+                positions,
+                query,
+                key,
+                cos_sin_cache,
+                *_stride3(query),
+                *_stride3(key),
+            )
+        if ALLOW_CONTIGUOUS_COPY:
+            positions = positions.contiguous()
+            query = query.contiguous()
+            key = key.contiguous()
+            cos_sin_cache = cos_sin_cache.contiguous()
+            return _C.rotary_embedding(
+                positions,
+                query,
+                key,
+                cos_sin_cache,
+                *_stride3(query),
+                *_stride3(key),
+            )
 
     cos_sin = cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
@@ -75,15 +142,38 @@ def store_kvcache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    if _usable(key, value, k_cache, v_cache, slot_mapping):
-        _C.store_kvcache(
-            key.contiguous(),
-            value.contiguous(),
-            k_cache,
-            v_cache,
-            slot_mapping.contiguous(),
+    if USE_CUDA_KVSTORE and _usable_cuda(key, value, k_cache, v_cache, slot_mapping):
+        key_inner_contiguous = key.stride(1) == key.size(2) and key.stride(2) == 1
+        value_inner_contiguous = value.stride(1) == value.size(2) and value.stride(2) == 1
+        layout_ready = (
+            slot_mapping.is_contiguous()
+            and k_cache.is_contiguous()
+            and v_cache.is_contiguous()
+            and key_inner_contiguous
+            and value_inner_contiguous
+            and (USE_STRIDE_AWARE_KERNELS or (key.is_contiguous() and value.is_contiguous()))
         )
-        return
+        if layout_ready:
+            _C.store_kvcache(
+                key,
+                value,
+                k_cache,
+                v_cache,
+                slot_mapping,
+            )
+            return
+        if ALLOW_CONTIGUOUS_COPY and k_cache.is_contiguous() and v_cache.is_contiguous():
+            key = key.contiguous()
+            value = value.contiguous()
+            slot_mapping = slot_mapping.contiguous()
+            _C.store_kvcache(
+                key,
+                value,
+                k_cache,
+                v_cache,
+                slot_mapping,
+            )
+            return
 
     valid = slot_mapping >= 0
     if not valid.any():

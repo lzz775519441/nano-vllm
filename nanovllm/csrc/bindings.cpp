@@ -6,8 +6,23 @@
 torch::Tensor sample(torch::Tensor logits, torch::Tensor temperatures, std::uint64_t seed);
 torch::Tensor rms_norm(torch::Tensor x, torch::Tensor weight, double eps);
 std::vector<torch::Tensor> add_rms_norm(torch::Tensor x, torch::Tensor residual, torch::Tensor weight, double eps);
-std::vector<torch::Tensor> rotary_embedding(torch::Tensor positions, torch::Tensor query, torch::Tensor key, torch::Tensor cos_sin_cache);
-void store_kvcache(torch::Tensor key, torch::Tensor value, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor slot_mapping);
+std::vector<torch::Tensor> rotary_embedding(
+    torch::Tensor positions,
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor cos_sin_cache,
+    std::int64_t query_stride0,
+    std::int64_t query_stride1,
+    std::int64_t query_stride2,
+    std::int64_t key_stride0,
+    std::int64_t key_stride1,
+    std::int64_t key_stride2);
+void store_kvcache(
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor slot_mapping);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sample", &sample, "Fused Gumbel-max sampling");
