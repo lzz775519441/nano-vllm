@@ -6,7 +6,7 @@ __pycache__/
 # C extensions
 *.so
 .clangd
-
+*profile*
 # Distribution / packaging
 .Python
 build/

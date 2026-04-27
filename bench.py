@@ -3,7 +3,7 @@ import time
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
-
+import torch
 
 def main():
     seed(0)
@@ -20,9 +20,14 @@ def main():
     # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     llm.generate(["Benchmark: "], SamplingParams())
+    torch.cuda.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStart()
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    torch.cuda.synchronize()
     t = (time.time() - t)
+    torch.cuda.cudart().cudaProfilerStop()
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
     print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
