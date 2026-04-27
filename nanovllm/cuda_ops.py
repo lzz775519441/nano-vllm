@@ -62,9 +62,9 @@ def store_kvcache(
     slot_mapping: torch.Tensor,
 ) -> None:
     torch.ops.nanovllm.store_kvcache(
-        key.contiguous(),
-        value.contiguous(),
+        key,
+        value,
         k_cache,
         v_cache,
-        slot_mapping.contiguous(),
+        slot_mapping,
     )
