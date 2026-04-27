@@ -29,7 +29,7 @@ inline void check_contiguous(const torch::Tensor &t, const char *name) {
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
-__device__ __forceinline__ std::uint32_t sample_hash32(std::uint64_t seed,
+__device__ __forceinline__ std::uint32_t sample_hash32(int64_t seed,
                                                        int row, int col) {
   std::uint32_t x =
       static_cast<std::uint32_t>(seed) ^ static_cast<std::uint32_t>(seed >> 32);
@@ -43,7 +43,7 @@ __device__ __forceinline__ std::uint32_t sample_hash32(std::uint64_t seed,
   return x;
 }
 
-__device__ __forceinline__ float uniform01(std::uint64_t seed, int row,
+__device__ __forceinline__ float uniform01(int64_t seed, int row,
                                            int col) {
   constexpr float scale = 0x1.0p-24f;
   return (static_cast<float>(sample_hash32(seed, row, col) >> 8) + 0.5f) *
