@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <torch/library.h>
 
 #include <cstdint>
 #include <vector>
@@ -16,11 +17,26 @@ void store_kvcache(torch::Tensor key, torch::Tensor value,
                    torch::Tensor k_cache, torch::Tensor v_cache,
                    torch::Tensor slot_mapping);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("sample", &sample, "Fused Gumbel-max sampling");
-    m.def("rms_norm", &rms_norm, "Fused RMSNorm");
-    m.def("add_rms_norm", &add_rms_norm, "Fused residual add + RMSNorm");
-    m.def("rotary_embedding", &rotary_embedding, "Fused rotary embedding");
-    m.def("store_kvcache", &store_kvcache,
-          "Store key/value tensors into paged KV cache");
+TORCH_LIBRARY(nanovllm, m) {
+  m.def("sample(Tensor logits, Tensor temperatures, int seed) -> Tensor");
+  m.def("rms_norm(Tensor x, Tensor weight, float eps) -> Tensor");
+  m.def(
+      "add_rms_norm(Tensor x, Tensor residual, Tensor weight, float eps) -> "
+      "Tensor[]");
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor query, Tensor key, Tensor "
+      "cos_sin_cache) -> Tensor[]");
+  m.def(
+      "store_kvcache(Tensor key, Tensor value, Tensor(a!) k_cache, Tensor(b!) "
+      "v_cache, Tensor slot_mapping) -> ()");
 }
+
+TORCH_LIBRARY_IMPL(nanovllm, CUDA, m) {
+  m.impl("sample", &sample);
+  m.impl("rms_norm", &rms_norm);
+  m.impl("add_rms_norm", &add_rms_norm);
+  m.impl("rotary_embedding", &rotary_embedding);
+  m.impl("store_kvcache", &store_kvcache);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
