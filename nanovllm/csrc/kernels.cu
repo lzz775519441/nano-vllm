@@ -1,9 +1,8 @@
-#include <torch/extension.h>
-
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 
 #include <cfloat>
 #include <cstdint>
@@ -13,8 +12,10 @@
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr int kQwen3QHeads = 32;
 constexpr int kQwen3KvHeads = 8;
 constexpr int kQwen3HeadDim = 128;
+constexpr int kQwen3RotaryPairs = kQwen3HeadDim / 2;
 constexpr int kQwen3KvWidth = kQwen3KvHeads * kQwen3HeadDim;
 constexpr int kQwen3KvVecElems = sizeof(uint4) / sizeof(c10::BFloat16);
 constexpr int kQwen3KvWidthVec = kQwen3KvWidth / kQwen3KvVecElems;
@@ -40,7 +41,7 @@ __device__ __forceinline__ float uniform01(std::uint64_t seed, int row,
   x ^= static_cast<std::uint64_t>(row) * 0xd1b54a32d192ed03ULL;
   x ^= static_cast<std::uint64_t>(col) * 0xabc98388fb8fac03ULL;
   x = splitmix64(x);
-  constexpr double denom = 1.0 / 9007199254740992.0; // 2^53
+  constexpr double denom = 1.0 / 9007199254740992.0;  // 2^53
   double u = static_cast<double>(x >> 11) * denom;
   u = fmin(fmax(u, 1.0e-12), 1.0 - 1.0e-12);
   return static_cast<float>(u);
@@ -165,58 +166,69 @@ __global__ void add_rms_norm_kernel(const scalar_t *__restrict__ x,
   }
 }
 
-template <typename scalar_t>
-__global__ void rotary_one_kernel(const int64_t *__restrict__ positions,
-                                  const scalar_t *__restrict__ input,
-                                  scalar_t *__restrict__ output,
-                                  const float *__restrict__ cos_sin_cache,
-                                  int tokens, int heads, int head_dim,
-                                  int64_t input_stride0, int64_t input_stride1,
-                                  int64_t input_stride2) {
-  int64_t total = static_cast<int64_t>(tokens) * heads * (head_dim / 2);
-  for (int64_t linear =
-           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       linear < total; linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    int half = head_dim / 2;
-    int i = linear % half;
-    int head = (linear / half) % heads;
-    int token = linear / (half * heads);
-    // TODO(stride-aware): use input_stride* to read non-contiguous input.
-    int64_t base = (static_cast<int64_t>(token) * heads + head) * head_dim;
-    int64_t pos = positions[token];
-    const float *cache = cos_sin_cache + pos * head_dim;
-    float cos = cache[i];
-    float sin = cache[i + half];
-    float x1 = static_cast<float>(input[base + i]);
-    float x2 = static_cast<float>(input[base + i + half]);
-    output[base + i] = static_cast<scalar_t>(x1 * cos - x2 * sin);
-    output[base + i + half] = static_cast<scalar_t>(x2 * cos + x1 * sin);
-  }
+__global__ void qwen3_rotary_qk_kernel(
+    const int64_t *__restrict__ positions,
+    const c10::BFloat16 *__restrict__ query,
+    const c10::BFloat16 *__restrict__ key, c10::BFloat16 *__restrict__ q_out,
+    c10::BFloat16 *__restrict__ k_out, const float *__restrict__ cos_sin_cache,
+    int64_t positions_stride0, int64_t q_stride0, int64_t q_stride1,
+    int64_t q_stride2, int64_t k_stride0, int64_t k_stride1, int64_t k_stride2,
+    int64_t cos_sin_stride0, int64_t cos_sin_stride2) {
+  int token = blockIdx.x;
+  int head = blockIdx.y;
+  int i = threadIdx.x;
+  if (i >= kQwen3RotaryPairs) return;
+  int64_t pos = positions[static_cast<int64_t>(token) * positions_stride0];
+  const float *cache = cos_sin_cache + pos * cos_sin_stride0;
+  float cos = cache[static_cast<int64_t>(i) * cos_sin_stride2];
+  float sin =
+      cache[static_cast<int64_t>(i + kQwen3RotaryPairs) * cos_sin_stride2];
+  int64_t q_base = static_cast<int64_t>(token) * q_stride0 +
+                   static_cast<int64_t>(head) * q_stride1;
+  int64_t q_output_base =
+      (static_cast<int64_t>(token) * kQwen3QHeads + head) * kQwen3HeadDim;
+  int64_t q_i = q_base + static_cast<int64_t>(i) * q_stride2;
+  int64_t q_half =
+      q_base + static_cast<int64_t>(i + kQwen3RotaryPairs) * q_stride2;
+  float q1 = static_cast<float>(query[q_i]);
+  float q2 = static_cast<float>(query[q_half]);
+  q_out[q_output_base + i] = static_cast<c10::BFloat16>(q1 * cos - q2 * sin);
+  q_out[q_output_base + i + kQwen3RotaryPairs] =
+      static_cast<c10::BFloat16>(q1 * sin + q2 * cos);
+  if (head >= kQwen3KvHeads) return;
+  int64_t k_base = static_cast<int64_t>(token) * k_stride0 +
+                   static_cast<int64_t>(head) * k_stride1;
+  int64_t k_output_base =
+      (static_cast<int64_t>(token) * kQwen3KvHeads + head) * kQwen3HeadDim;
+  int64_t k_i = k_base + static_cast<int64_t>(i) * k_stride2;
+  int64_t k_half =
+      k_base + static_cast<int64_t>(i + kQwen3RotaryPairs) * k_stride2;
+  float k1 = static_cast<float>(key[k_i]);
+  float k2 = static_cast<float>(key[k_half]);
+  k_out[k_output_base + i] = static_cast<c10::BFloat16>(k1 * cos - k2 * sin);
+  k_out[k_output_base + i + kQwen3RotaryPairs] =
+      static_cast<c10::BFloat16>(k1 * sin + k2 * cos);
 }
 
 __global__ void store_kvcache_vec_kernel(
     const uint4 *__restrict__ key, const uint4 *__restrict__ value,
     uint4 *__restrict__ k_cache, uint4 *__restrict__ v_cache,
-    const int32_t *__restrict__ slot_mapping, int64_t kv_stride0_vec) {
+    const int32_t *__restrict__ slot_mapping, int64_t k_stride0_vec,
+    int64_t v_stride0_vec) {
   int token = blockIdx.x;
   int col = threadIdx.x;
   int slot = slot_mapping[token];
-  if (slot < 0)
-    return;
-  int64_t src = static_cast<int64_t>(token) * kv_stride0_vec;
+  if (slot < 0) return;
+  int64_t k_src = static_cast<int64_t>(token) * k_stride0_vec;
+  int64_t v_src = static_cast<int64_t>(token) * v_stride0_vec;
   int64_t dst = static_cast<int64_t>(slot) * kQwen3KvWidthVec;
   for (int i = col; i < kQwen3KvWidthVec; i += blockDim.x) {
-    k_cache[dst + i] = key[src + i];
-    v_cache[dst + i] = value[src + i];
+    k_cache[dst + i] = key[k_src + i];
+    v_cache[dst + i] = value[v_src + i];
   }
 }
 
-int blocks_for(int64_t n) {
-  return static_cast<int>(
-      std::min<int64_t>((n + kBlockSize - 1) / kBlockSize, 65535));
-}
-
-} // namespace
+}  // namespace
 
 torch::Tensor sample(torch::Tensor logits, torch::Tensor temperatures,
                      std::uint64_t seed) {
@@ -312,64 +324,51 @@ std::vector<torch::Tensor> add_rms_norm(torch::Tensor x, torch::Tensor residual,
   return {out, new_residual};
 }
 
-std::vector<torch::Tensor>
-rotary_embedding(torch::Tensor positions, torch::Tensor query,
-                 torch::Tensor key, torch::Tensor cos_sin_cache,
-                 int64_t query_stride0, int64_t query_stride1,
-                 int64_t query_stride2, int64_t key_stride0,
-                 int64_t key_stride1, int64_t key_stride2) {
+std::vector<torch::Tensor> rotary_embedding(torch::Tensor positions,
+                                            torch::Tensor query,
+                                            torch::Tensor key,
+                                            torch::Tensor cos_sin_cache) {
   check_cuda(positions, "positions");
   check_cuda(query, "query");
   check_cuda(key, "key");
   check_cuda(cos_sin_cache, "cos_sin_cache");
-  check_contiguous(positions, "positions");
-  TORCH_CHECK(cos_sin_cache.is_contiguous(),
-              "cos_sin_cache must be contiguous");
   TORCH_CHECK(positions.scalar_type() == torch::kInt64,
               "positions must be int64");
   TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kFloat32,
               "cos_sin_cache must be float32");
-  TORCH_CHECK(query.dim() == 3 && key.dim() == 3,
-              "query/key must be [tokens, heads, head_dim]");
-  TORCH_CHECK(query.scalar_type() == key.scalar_type(),
-              "query/key dtype mismatch");
+  TORCH_CHECK(query.scalar_type() == torch::kBFloat16 &&
+                  key.scalar_type() == torch::kBFloat16,
+              "Qwen3 rotary only supports bfloat16 query/key");
+  TORCH_CHECK(query.dim() == 3 && query.size(1) == kQwen3QHeads &&
+                  query.size(2) == kQwen3HeadDim,
+              "Qwen3 rotary expects query [tokens, 32, 128]");
+  TORCH_CHECK(key.dim() == 3 && key.size(1) == kQwen3KvHeads &&
+                  key.size(2) == kQwen3HeadDim,
+              "Qwen3 rotary expects key [tokens, 8, 128]");
   TORCH_CHECK(query.size(0) == key.size(0), "query/key token count mismatch");
-  TORCH_CHECK(query.size(2) == key.size(2), "query/key head_dim mismatch");
-  TORCH_CHECK(query.size(2) % 2 == 0, "head_dim must be even");
   TORCH_CHECK(positions.size(0) == query.size(0),
               "positions token count mismatch");
   TORCH_CHECK(cos_sin_cache.dim() == 3 && cos_sin_cache.size(1) == 1 &&
-                  cos_sin_cache.size(2) == query.size(2),
-              "cos_sin_cache must be [max_position, 1, head_dim]");
+                  cos_sin_cache.size(2) == kQwen3HeadDim,
+              "cos_sin_cache must be [max_position, 1, 128]");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   auto q_out = torch::empty(query.sizes(), query.options());
   auto k_out = torch::empty(key.sizes(), key.options());
   int tokens = static_cast<int>(query.size(0));
-  int q_heads = static_cast<int>(query.size(1));
-  int k_heads = static_cast<int>(key.size(1));
-  int head_dim = static_cast<int>(query.size(2));
+  int64_t positions_stride0 = positions.stride(0);
+  int64_t cos_sin_stride0 = cos_sin_cache.stride(0);
+  int64_t cos_sin_stride2 = cos_sin_cache.stride(2);
   auto stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      torch::kHalf, torch::kBFloat16, query.scalar_type(),
-      "rotary_embedding_cuda", [&] {
-        int64_t q_work =
-            static_cast<int64_t>(tokens) * q_heads * (head_dim / 2);
-        int64_t k_work =
-            static_cast<int64_t>(tokens) * k_heads * (head_dim / 2);
-        rotary_one_kernel<scalar_t>
-            <<<blocks_for(q_work), kBlockSize, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                q_out.data_ptr<scalar_t>(), cos_sin_cache.data_ptr<float>(),
-                tokens, q_heads, head_dim, query_stride0, query_stride1,
-                query_stride2);
-        rotary_one_kernel<scalar_t>
-            <<<blocks_for(k_work), kBlockSize, 0, stream>>>(
-                positions.data_ptr<int64_t>(), key.data_ptr<scalar_t>(),
-                k_out.data_ptr<scalar_t>(), cos_sin_cache.data_ptr<float>(),
-                tokens, k_heads, head_dim, key_stride0, key_stride1,
-                key_stride2);
-      });
+  dim3 block(kQwen3RotaryPairs);
+  dim3 grid(tokens, kQwen3QHeads);
+  qwen3_rotary_qk_kernel<<<grid, block, 0, stream>>>(
+      positions.data_ptr<int64_t>(), query.data_ptr<c10::BFloat16>(),
+      key.data_ptr<c10::BFloat16>(), q_out.data_ptr<c10::BFloat16>(),
+      k_out.data_ptr<c10::BFloat16>(), cos_sin_cache.data_ptr<float>(),
+      positions_stride0, query.stride(0), query.stride(1), query.stride(2),
+      key.stride(0), key.stride(1), key.stride(2), cos_sin_stride0,
+      cos_sin_stride2);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {q_out, k_out};
 }
@@ -405,18 +404,18 @@ void store_kvcache(torch::Tensor key, torch::Tensor value,
               "key inner layout must be contiguous");
   TORCH_CHECK(value.stride(1) == kQwen3HeadDim && value.stride(2) == 1,
               "value inner layout must be contiguous");
-  TORCH_CHECK(key.stride(0) == value.stride(0),
-              "key/value token stride mismatch");
   TORCH_CHECK(key.stride(0) % kQwen3KvVecElems == 0,
-              "key/value token stride must be 16-byte aligned");
+              "key token stride must be 16-byte aligned");
+  TORCH_CHECK(value.stride(0) % kQwen3KvVecElems == 0,
+              "value token stride must be 16-byte aligned");
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
               "KV cache must be [blocks, block_size, heads, head_dim]");
-  TORCH_CHECK(k_cache.size(2) == kQwen3KvHeads &&
-                  k_cache.size(3) == kQwen3HeadDim,
-              "k_cache shape mismatch");
-  TORCH_CHECK(v_cache.size(2) == kQwen3KvHeads &&
-                  v_cache.size(3) == kQwen3HeadDim,
-              "v_cache shape mismatch");
+  TORCH_CHECK(
+      k_cache.size(2) == kQwen3KvHeads && k_cache.size(3) == kQwen3HeadDim,
+      "k_cache shape mismatch");
+  TORCH_CHECK(
+      v_cache.size(2) == kQwen3KvHeads && v_cache.size(3) == kQwen3HeadDim,
+      "v_cache shape mismatch");
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 block(kBlockSize);
   dim3 grid(tokens);
@@ -425,6 +424,7 @@ void store_kvcache(torch::Tensor key, torch::Tensor value,
       reinterpret_cast<const uint4 *>(value.data_ptr<c10::BFloat16>()),
       reinterpret_cast<uint4 *>(k_cache.data_ptr<c10::BFloat16>()),
       reinterpret_cast<uint4 *>(v_cache.data_ptr<c10::BFloat16>()),
-      slot_mapping.data_ptr<int32_t>(), key.stride(0) / kQwen3KvVecElems);
+      slot_mapping.data_ptr<int32_t>(), key.stride(0) / kQwen3KvVecElems,
+      value.stride(0) / kQwen3KvVecElems);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -44,12 +44,20 @@ def test_add_rms_norm_matches_torch():
 def test_rotary_embedding_matches_torch():
     if not _available():
         return
-    tokens, q_heads, k_heads, head_dim = 11, 4, 2, 64
-    positions = torch.arange(tokens, device="cuda", dtype=torch.int64)
-    query = torch.randn(tokens, q_heads, head_dim, device="cuda", dtype=torch.float16)
-    key = torch.randn(tokens, k_heads, head_dim, device="cuda", dtype=torch.float16)
-    freqs = torch.randn(32, head_dim // 2, device="cuda")
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).unsqueeze(1)
+    tokens, q_heads, k_heads, head_dim = 11, 32, 8, 128
+    positions_storage = torch.empty(tokens * 2, device="cuda", dtype=torch.int64)
+    positions = positions_storage[::2]
+    positions.copy_(torch.arange(tokens, device="cuda", dtype=torch.int64))
+    query_storage = torch.randn(tokens, q_heads + 1, head_dim * 2, device="cuda", dtype=torch.bfloat16)
+    key_storage = torch.randn(tokens, k_heads + 1, head_dim * 2, device="cuda", dtype=torch.bfloat16)
+    query = query_storage[:, :q_heads, ::2]
+    key = key_storage[:, :k_heads, ::2]
+    freqs = torch.randn(64, head_dim // 2, device="cuda")
+    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).unsqueeze(1)[::2]
+    assert not positions.is_contiguous()
+    assert not query.is_contiguous()
+    assert not key.is_contiguous()
+    assert not cos_sin_cache.is_contiguous()
 
     q, k = cuda_ops.rotary_embedding(positions, query, key, cos_sin_cache)
     cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
@@ -58,17 +66,19 @@ def test_rotary_embedding_matches_torch():
         x1, x2 = x.float().chunk(2, dim=-1)
         return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).to(x.dtype)
 
-    torch.testing.assert_close(q, ref(query), rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(k, ref(key), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(q, ref(query), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(k, ref(key), rtol=2e-2, atol=2e-2)
 
 
 def test_store_kvcache_matches_reference():
     if not _available():
         return
-    tokens, block_size, heads, head_dim = 6, 4, 2, 16
-    key = torch.randn(tokens, heads, head_dim, device="cuda", dtype=torch.float16)
-    value = torch.randn_like(key)
-    k_cache = torch.zeros(3, block_size, heads, head_dim, device="cuda", dtype=torch.float16)
+    tokens, block_size, heads, head_dim = 6, 16, 8, 128
+    key = torch.randn(tokens, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    value_storage = torch.randn(tokens, heads + 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = value_storage[:, :heads, :]
+    assert key.stride(0) != value.stride(0)
+    k_cache = torch.zeros(3, block_size, heads, head_dim, device="cuda", dtype=torch.bfloat16)
     v_cache = torch.zeros_like(k_cache)
     slot_mapping = torch.tensor([0, 5, -1, 7, 8, 10], device="cuda", dtype=torch.int32)
 

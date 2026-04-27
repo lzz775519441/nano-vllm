@@ -23,7 +23,6 @@ USE_CUDA_SAMPLE = _env_flag("NANOVLLM_CUDA_SAMPLE")
 USE_CUDA_RMSNORM = _env_flag("NANOVLLM_CUDA_RMSNORM")
 USE_CUDA_ROPE = _env_flag("NANOVLLM_CUDA_ROPE")
 USE_CUDA_KVSTORE = _env_flag("NANOVLLM_CUDA_KVSTORE")
-USE_STRIDE_AWARE_KERNELS = _env_flag("NANOVLLM_CUDA_STRIDE_AWARE", False)
 
 # The current native kernels assume contiguous tensor layouts.  Keep this off
 # by default so the wrapper never hides an expensive copy behind a fast-looking
@@ -43,14 +42,6 @@ def _contiguous_or_none(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...] | No
     if ALLOW_CONTIGUOUS_COPY:
         return tuple(t.contiguous() for t in tensors)
     return None
-
-
-def _native_layout_ready(*tensors: torch.Tensor) -> bool:
-    return _usable_cuda(*tensors) and (USE_STRIDE_AWARE_KERNELS or all(t.is_contiguous() for t in tensors))
-
-
-def _stride3(tensor: torch.Tensor) -> tuple[int, int, int]:
-    return tensor.stride(0), tensor.stride(1), tensor.stride(2)
 
 
 def _next_seed() -> int:
@@ -103,28 +94,7 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if USE_CUDA_ROPE and _usable_cuda(positions, query, key, cos_sin_cache):
-        if positions.is_contiguous() and cos_sin_cache.is_contiguous() and _native_layout_ready(query, key):
-            return _C.rotary_embedding(
-                positions,
-                query,
-                key,
-                cos_sin_cache,
-                *_stride3(query),
-                *_stride3(key),
-            )
-        if ALLOW_CONTIGUOUS_COPY:
-            positions = positions.contiguous()
-            query = query.contiguous()
-            key = key.contiguous()
-            cos_sin_cache = cos_sin_cache.contiguous()
-            return _C.rotary_embedding(
-                positions,
-                query,
-                key,
-                cos_sin_cache,
-                *_stride3(query),
-                *_stride3(key),
-            )
+        return _C.rotary_embedding(positions, query, key, cos_sin_cache)
 
     cos_sin = cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
