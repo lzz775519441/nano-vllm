@@ -69,7 +69,7 @@ template <typename scalar_t>
 __global__ void sample_kernel(const scalar_t *__restrict__ logits,
                               const float *__restrict__ temperatures,
                               int64_t *__restrict__ output, int batch,
-                              int vocab, std::uint64_t seed) {
+                              int vocab, int64_t seed) {
   int row = blockIdx.x;
   int tid = threadIdx.x;
   float inv_temp = 1.0f / temperatures[row];
@@ -244,7 +244,7 @@ __global__ void store_kvcache_vec_kernel(
 }  // namespace
 
 torch::Tensor sample(torch::Tensor logits, torch::Tensor temperatures,
-                     std::uint64_t seed) {
+                     int64_t seed) {
   check_cuda(logits, "logits");
   check_cuda(temperatures, "temperatures");
   check_contiguous(logits, "logits");

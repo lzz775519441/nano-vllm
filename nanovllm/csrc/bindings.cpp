@@ -5,7 +5,7 @@
 #include <vector>
 
 torch::Tensor sample(torch::Tensor logits, torch::Tensor temperatures,
-                     std::uint64_t seed);
+                     int64_t seed);
 torch::Tensor rms_norm(torch::Tensor x, torch::Tensor weight, double eps);
 std::vector<torch::Tensor> add_rms_norm(torch::Tensor x, torch::Tensor residual,
                                         torch::Tensor weight, double eps);
