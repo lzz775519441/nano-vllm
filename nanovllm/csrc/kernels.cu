@@ -12,6 +12,7 @@
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr int kSampleBlockSize = 1024;
 constexpr int kQwen3QHeads = 32;
 constexpr int kQwen3KvHeads = 8;
 constexpr int kQwen3HeadDim = 128;
@@ -28,23 +29,40 @@ inline void check_contiguous(const torch::Tensor &t, const char *name) {
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
-__device__ __forceinline__ std::uint64_t splitmix64(std::uint64_t x) {
-  x += 0x9e3779b97f4a7c15ULL;
-  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-  return x ^ (x >> 31);
+__device__ __forceinline__ std::uint32_t sample_hash32(std::uint64_t seed,
+                                                       int row, int col) {
+  std::uint32_t x =
+      static_cast<std::uint32_t>(seed) ^ static_cast<std::uint32_t>(seed >> 32);
+  x ^= static_cast<std::uint32_t>(row) * 0x9e3779b9U;
+  x ^= static_cast<std::uint32_t>(col) * 0x85ebca6bU;
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
 }
 
 __device__ __forceinline__ float uniform01(std::uint64_t seed, int row,
                                            int col) {
-  std::uint64_t x = seed;
-  x ^= static_cast<std::uint64_t>(row) * 0xd1b54a32d192ed03ULL;
-  x ^= static_cast<std::uint64_t>(col) * 0xabc98388fb8fac03ULL;
-  x = splitmix64(x);
-  constexpr double denom = 1.0 / 9007199254740992.0;  // 2^53
-  double u = static_cast<double>(x >> 11) * denom;
-  u = fmin(fmax(u, 1.0e-12), 1.0 - 1.0e-12);
-  return static_cast<float>(u);
+  constexpr float scale = 0x1.0p-24f;
+  return (static_cast<float>(sample_hash32(seed, row, col) >> 8) + 0.5f) *
+         scale;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void reduce_pair(float &score, int &idx) {
+  unsigned mask = 0xffffffff;
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float other_score = __shfl_down_sync(mask, score, offset);
+    int other_idx = __shfl_down_sync(mask, idx, offset);
+
+    if (other_score > score || (other_score == score && other_idx < idx)) {
+      score = other_score;
+      idx = other_idx;
+    }
+  }
 }
 
 template <typename scalar_t>
@@ -55,43 +73,38 @@ __global__ void sample_kernel(const scalar_t *__restrict__ logits,
   int row = blockIdx.x;
   int tid = threadIdx.x;
   float inv_temp = 1.0f / temperatures[row];
+  const scalar_t *__restrict__ row_logits =
+      logits + static_cast<int64_t>(row) * vocab;
   float best_score = -FLT_MAX;
   int best_idx = 0;
-
   for (int col = tid; col < vocab; col += blockDim.x) {
-    float logit =
-        static_cast<float>(logits[static_cast<int64_t>(row) * vocab + col]) *
-        inv_temp;
+    float logit = static_cast<float>(row_logits[col]) * inv_temp;
     float u = uniform01(seed, row, col);
-    float gumbel = -logf(-logf(u));
+    float gumbel = -__logf(-__logf(u));
     float score = logit + gumbel;
     if (score > best_score || (score == best_score && col < best_idx)) {
       best_score = score;
       best_idx = col;
     }
   }
-
-  __shared__ float scores[kBlockSize];
-  __shared__ int indices[kBlockSize];
-  scores[tid] = best_score;
-  indices[tid] = best_idx;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      float other_score = scores[tid + stride];
-      int other_idx = indices[tid + stride];
-      if (other_score > scores[tid] ||
-          (other_score == scores[tid] && other_idx < indices[tid])) {
-        scores[tid] = other_score;
-        indices[tid] = other_idx;
-      }
-    }
-    __syncthreads();
+  reduce_pair<scalar_t>(best_score, best_idx);
+  int lane = tid & 31;
+  int warp_id = tid >> 5;
+  __shared__ float warp_scores[32];
+  __shared__ int warp_indices[32];
+  if (lane == 0) {
+    warp_scores[warp_id] = best_score;
+    warp_indices[warp_id] = best_idx;
   }
-
-  if (tid == 0) {
-    output[row] = static_cast<int64_t>(indices[0]);
+  __syncthreads();
+  if (warp_id == 0) {
+    int num_warps = (blockDim.x + 31) >> 5;
+    best_score = (lane < num_warps) ? warp_scores[lane] : -FLT_MAX;
+    best_idx = (lane < num_warps) ? warp_indices[lane] : 0;
+    reduce_pair<scalar_t>(best_score, best_idx);
+    if (lane == 0) {
+      output[row] = static_cast<int64_t>(best_idx);
+    }
   }
 }
 
@@ -250,7 +263,7 @@ torch::Tensor sample(torch::Tensor logits, torch::Tensor temperatures,
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, logits.scalar_type(), "sample_cuda", [&] {
-        sample_kernel<scalar_t><<<batch, kBlockSize, 0, stream>>>(
+        sample_kernel<scalar_t><<<batch, kSampleBlockSize, 0, stream>>>(
             logits.data_ptr<scalar_t>(), temperatures.data_ptr<float>(),
             output.data_ptr<int64_t>(), batch, vocab, seed);
       });
