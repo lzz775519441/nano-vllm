@@ -1,3 +1,4 @@
+import gc
 import pickle
 import warnings
 import torch
@@ -489,11 +490,31 @@ class ModelRunner:
             self.capture_piece_next_graph(key, layer_idx, runtime_vars)
         self.capture_piece_last_graph(key, num_layers - 1, runtime_vars)
 
+    def release_piecewise_bucket(self, key: tuple[int, int, int, int]):
+        graph_keys = [graph_key for graph_key in self.piecewise_graphs if graph_key[-1] == key]
+        for graph_key in graph_keys:
+            del self.piecewise_graphs[graph_key]
+        self.piecewise_runtime_vars.pop(key, None)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def piecewise_graph_allowed(self, key: tuple[int, int, int, int]):
+        limit = self.config.max_piecewise_cudagraph_tokens
+        return limit > 0 and key[1] <= limit
+
     def run_piecewise_graph(self, input_ids: torch.Tensor, positions: torch.Tensor):
         actual_context = get_context()
         key = self.get_varlen_graph_key(input_ids)
         disabled_key = (RuntimeMode.PIECEWISE, key)
         if disabled_key in self.disabled_graphs:
+            return False, None
+        if not self.piecewise_graph_allowed(key):
+            self.disabled_graphs.add(disabled_key)
+            warnings.warn(
+                f"Piecewise CUDA graph skipped for bucket {key}: token bucket exceeds "
+                f"max_piecewise_cudagraph_tokens={self.config.max_piecewise_cudagraph_tokens}",
+                RuntimeWarning,
+            )
             return False, None
         runtime_vars = self.get_piecewise_runtime_vars(key)
         try:
@@ -520,6 +541,8 @@ class ModelRunner:
             self.disabled_graphs.add(disabled_key)
             set_context_obj(actual_context)
             if isinstance(exc, torch.cuda.OutOfMemoryError):
+                runtime_vars = None
+                self.release_piecewise_bucket(key)
                 torch.cuda.empty_cache()
             warnings.warn(f"Piecewise CUDA graph disabled for bucket {key}: {exc}", RuntimeWarning)
             return False, None

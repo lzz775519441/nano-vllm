@@ -13,6 +13,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     cudagraph_mode: str = "full_and_piecewise"
+    max_piecewise_cudagraph_tokens: int = 4096
     hf_config: Any | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -23,6 +24,7 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.cudagraph_mode in {"none", "full_decode_only", "piecewise", "full_and_piecewise"}
+        assert self.max_piecewise_cudagraph_tokens >= 0
         from transformers import AutoConfig
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
