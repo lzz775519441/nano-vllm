@@ -74,6 +74,15 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        q, k, v = self.pre_attention(positions, hidden_states)
+        o = self.attn(q, k, v)
+        return self.post_attention(o)
+
+    def pre_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -83,9 +92,13 @@ class Qwen3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
-        return output
+        return q, k, v
+
+    def post_attention(
+        self,
+        attn_output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.o_proj(attn_output.flatten(1, -1))
 
 
 class Qwen3MLP(nn.Module):
@@ -149,11 +162,37 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        q, k, v, residual = self.pre_attention(positions, hidden_states, residual)
+        attn_output = self.attention(q, k, v)
+        return self.post_attention(attn_output, residual)
+
+    def pre_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
+        q, k, v = self.self_attn.pre_attention(positions, hidden_states)
+        return q, k, v, residual
+
+    def attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.self_attn.attn(q, k, v)
+
+    def post_attention(
+        self,
+        attn_output: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.self_attn.post_attention(attn_output)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -179,6 +218,34 @@ class Qwen3Model(nn.Module):
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+    def first_piece(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = self.embed_tokens(input_ids)
+        return self.layers[0].pre_attention(positions, hidden_states, None)
+
+    def next_piece(
+        self,
+        layer_idx: int,
+        attn_output: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.layers[layer_idx].post_attention(attn_output, residual)
+        return self.layers[layer_idx + 1].pre_attention(positions, hidden_states, residual)
+
+    def final_piece(
+        self,
+        layer_idx: int,
+        attn_output: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states, residual = self.layers[layer_idx].post_attention(attn_output, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

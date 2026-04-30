@@ -45,6 +45,16 @@ class Sequence:
         return self.num_tokens - self.num_prompt_tokens
 
     @property
+    def scheduled_end(self):
+        return self.num_cached_tokens + self.num_scheduled_tokens
+
+    @property
+    def needs_sampling(self):
+        if self.num_scheduled_tokens == 0:
+            return False
+        return not self.is_prefill or self.scheduled_end == self.num_tokens
+
+    @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
@@ -71,10 +81,10 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.is_prefill, self.block_table, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.is_prefill, self.block_table, last_state = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

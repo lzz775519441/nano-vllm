@@ -1,6 +1,11 @@
 from collections import deque
-import xxhash
-import numpy as np
+from array import array
+import hashlib
+
+try:
+    import xxhash
+except ModuleNotFoundError:
+    xxhash = None
 
 from nanovllm.engine.sequence import Sequence
 
@@ -34,10 +39,17 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+        token_bytes = array("q", token_ids).tobytes()
+        if xxhash is None:
+            h = hashlib.blake2b(digest_size=8)
+            if prefix != -1:
+                h.update(prefix.to_bytes(8, "little"))
+            h.update(token_bytes)
+            return int.from_bytes(h.digest(), "little")
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        h.update(token_bytes)
         return h.intdigest()
 
     def _allocate_block(self) -> int:
@@ -58,7 +70,6 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
@@ -66,10 +77,6 @@ class BlockManager:
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
             num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
@@ -87,9 +94,22 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
-            seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
+
+    def can_append_tokens(self, seq: Sequence, num_tokens: int) -> bool:
+        end = seq.num_cached_tokens + num_tokens
+        num_required_blocks = (end + self.block_size - 1) // self.block_size
+        num_new_blocks = max(0, num_required_blocks - len(seq.block_table))
+        return len(self.free_block_ids) >= num_new_blocks
+
+    def num_appendable_tokens(self, seq: Sequence) -> int:
+        return (len(seq.block_table) + len(self.free_block_ids)) * self.block_size - seq.num_cached_tokens
+
+    def may_append_tokens(self, seq: Sequence, num_tokens: int):
+        end = seq.num_cached_tokens + num_tokens
+        num_required_blocks = (end + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < num_required_blocks:
+            seq.block_table.append(self._allocate_block())
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -101,11 +121,10 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return self.can_append_tokens(seq, 1)
 
     def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
-            seq.block_table.append(self._allocate_block())
+        self.may_append_tokens(seq, 1)
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
