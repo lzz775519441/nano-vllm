@@ -22,6 +22,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_num_mixed_prefill_tokens = getattr(config, "max_num_mixed_prefill_tokens", self.max_num_batched_tokens)
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -61,10 +62,14 @@ class Scheduler:
                 continue
             break
 
-        # Chunked prefill uses whatever token budget remains after decode.
+        # Chunked prefill uses a smaller budget when mixed with decode, so
+        # running requests are not hidden behind a very large prefill chunk.
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
+            if num_decode_tokens > 0:
+                mixed_prefill_remaining = self.max_num_mixed_prefill_tokens - num_prefill_tokens
+                remaining = min(remaining, mixed_prefill_remaining)
+            if remaining <= 0:
                 break
             seq = self.waiting[0]
             if not seq.block_table:

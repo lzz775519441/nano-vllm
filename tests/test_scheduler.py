@@ -15,10 +15,13 @@ class SchedulerTest(unittest.TestCase):
     def tearDown(self):
         Sequence.block_size = self.old_block_size
 
-    def make_scheduler(self, max_tokens=4, max_seqs=8, num_blocks=16):
+    def make_scheduler(self, max_tokens=4, max_seqs=8, num_blocks=16, max_mixed_prefill_tokens=None):
+        if max_mixed_prefill_tokens is None:
+            max_mixed_prefill_tokens = max_tokens
         config = SimpleNamespace(
             max_num_seqs=max_seqs,
             max_num_batched_tokens=max_tokens,
+            max_num_mixed_prefill_tokens=max_mixed_prefill_tokens,
             eos=-1,
             kvcache_block_size=Sequence.block_size,
             num_kvcache_blocks=num_blocks,
@@ -94,6 +97,20 @@ class SchedulerTest(unittest.TestCase):
 
         self.assertEqual(running.completion_token_ids, [4, 50])
         self.assertEqual(waiting.completion_token_ids, [60])
+
+    def test_mixed_prefill_uses_separate_token_cap(self):
+        scheduler = self.make_scheduler(max_tokens=8, max_mixed_prefill_tokens=2)
+        running = self.make_running(scheduler, [1, 2, 3], 4)
+        waiting = Sequence([10, 11, 12, 13, 14])
+        scheduler.add(waiting)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.seqs, [running, waiting])
+        self.assertEqual(output.num_decode_tokens, 1)
+        self.assertEqual(output.num_prefill_tokens, 2)
+        self.assertEqual(waiting.num_scheduled_tokens, 2)
+        self.assertEqual(waiting.status, SequenceStatus.WAITING)
 
     def test_preempted_decode_returns_to_waiting_for_recompute(self):
         scheduler = self.make_scheduler(max_tokens=4, num_blocks=1)

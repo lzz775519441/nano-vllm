@@ -7,6 +7,7 @@ from typing import Any
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
+    max_num_mixed_prefill_tokens: int = 512
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
@@ -23,6 +24,7 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.max_num_mixed_prefill_tokens >= 0
         assert self.cudagraph_mode in {"none", "full_decode_only", "piecewise", "full_and_piecewise"}
         assert self.max_piecewise_cudagraph_tokens >= 0
         from transformers import AutoConfig
