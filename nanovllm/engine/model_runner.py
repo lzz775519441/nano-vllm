@@ -1,4 +1,3 @@
-import gc
 import pickle
 import warnings
 import torch
@@ -7,7 +6,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.cudagraph import BatchDescriptor, CUDAGraphDispatcher, RuntimeMode
+from nanovllm.engine.cudagraph import CUDAGraphDispatcher, RuntimeMode, eligible_full_decode_graph
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -58,8 +57,8 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graph_pool, self.full_decode_graphs, self.piecewise_graphs
-            del self.piecewise_runtime_vars, self.disabled_graphs
+            del self.graph_pool, self.full_decode_graphs, self.subgraph_graphs
+            del self.subgraph_runtime_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -226,174 +225,62 @@ class ModelRunner:
             return 1 << (n - 1).bit_length()
         return (n + 15) // 16 * 16
 
-    @staticmethod
-    def _pad_lens(num_seqs: int, num_tokens: int, max_len: int) -> list[int]:
-        if num_seqs == 0:
-            assert num_tokens == 0
+    def get_cudagraph_token_bucket(self, input_ids: torch.Tensor) -> int:
+        """Single capture key dimension (vLLM-style): padded total token count only."""
+        return self._round_bucket(input_ids.size(0))
+
+    def get_cudagraph_capture_sizes(self) -> list[int]:
+        limit = self.config.max_cudagraph_capture_tokens
+        if limit <= 0:
             return []
-        base, extra = divmod(num_tokens, num_seqs)
-        lens = [base + (i < extra) for i in range(num_seqs)]
-        assert all(0 < x <= max_len for x in lens)
-        return lens
+        sizes = self.config.cudagraph_capture_sizes
+        if sizes is None:
+            sizes = [1, 2, 4, 8]
+            size = 16
+            while size <= limit:
+                sizes.append(size)
+                size += 16
+        buckets = {self._round_bucket(size) for size in sizes if size <= limit}
+        return sorted(buckets)
 
-    @staticmethod
-    def _cu_seqlens(lens: list[int]) -> torch.Tensor:
-        cu_seqlens = [0]
-        for length in lens:
-            cu_seqlens.append(cu_seqlens[-1] + length)
-        return torch.tensor(cu_seqlens, dtype=torch.int32)
-
-    def get_varlen_graph_key(self, input_ids: torch.Tensor):
-        context = get_context()
-        num_seqs = context.cu_seqlens_q.numel() - 1
-        num_tokens = input_ids.size(0)
-        seq_bucket = min(self.config.max_num_seqs, self._round_bucket(num_seqs))
-        token_bucket = self._round_bucket(num_tokens)
-        max_q_bucket = self._round_bucket(max(context.max_seqlen_q, 1))
-
-        # Varlen attention expects cu_seqlens_q[-1] to match the static q size.
-        # Extra q tokens therefore need their own padded sequence rows.
-        pad_seqs = seq_bucket - num_seqs
-        if pad_seqs == 0:
-            token_bucket = num_tokens
-        else:
-            token_bucket = max(token_bucket, num_tokens + pad_seqs)
-            pad_tokens = token_bucket - num_tokens
-            if pad_tokens > pad_seqs * max_q_bucket:
-                max_q_bucket = self._round_bucket((pad_tokens + pad_seqs - 1) // pad_seqs)
-
-        max_k_bucket = self._round_bucket(max(context.max_seqlen_k, max_q_bucket, 1))
-        return seq_bucket, token_bucket, max_q_bucket, max_k_bucket
-
-    def get_decode_graph_key(self, input_ids: torch.Tensor):
-        context = get_context()
-        seq_bucket = min(self.config.max_num_seqs, self._round_bucket(input_ids.size(0)))
-        block_table_bucket = self._round_bucket(context.block_tables.size(1))
-        return seq_bucket, block_table_bucket
-
-    def get_piecewise_runtime_vars(self, key: tuple[int, int, int, int]):
-        if key in self.piecewise_runtime_vars:
-            return self.piecewise_runtime_vars[key]
+    def get_subgraph_runtime_vars(self, token_bucket: int) -> dict[str, torch.Tensor]:
+        if token_bucket in self.subgraph_runtime_vars:
+            return self.subgraph_runtime_vars[token_bucket]
         config = self.config
-        seq_bucket, token_bucket, max_q_bucket, max_k_bucket = key
+        seq_max = max(config.max_num_seqs, token_bucket)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         graph_vars = dict(
             input_ids=torch.zeros(token_bucket, dtype=torch.int64, device="cuda"),
             positions=torch.zeros(token_bucket, dtype=torch.int64, device="cuda"),
             slot_mapping=torch.full((token_bucket,), -1, dtype=torch.int32, device="cuda"),
-            cu_seqlens_q=self._cu_seqlens(self._pad_lens(seq_bucket, token_bucket, max_q_bucket)).cuda(non_blocking=True),
-            cu_seqlens_k=self._cu_seqlens(self._pad_lens(seq_bucket, token_bucket, max_q_bucket)).cuda(non_blocking=True),
-            block_tables=torch.full((seq_bucket, max_num_blocks), self.dummy_block_id, dtype=torch.int32, device="cuda"),
-            max_seqlen_q=max_q_bucket,
-            max_seqlen_k=max_k_bucket,
+            cache_seqlens=torch.zeros(token_bucket, dtype=torch.int32, device="cuda"),
+            block_tables=torch.full((seq_max, max_num_blocks), self.dummy_block_id, dtype=torch.int32, device="cuda"),
         )
-        self.piecewise_runtime_vars[key] = graph_vars
+        self.subgraph_runtime_vars[token_bucket] = graph_vars
         return graph_vars
 
-    def pad_piecewise_inputs(self, graph_vars: dict[str, torch.Tensor], input_ids: torch.Tensor, positions: torch.Tensor):
-        context = get_context()
-        seq_bucket = graph_vars["block_tables"].size(0)
-        token_bucket = graph_vars["input_ids"].size(0)
-        actual_seqs = context.cu_seqlens_q.numel() - 1
-        actual_tokens = input_ids.size(0)
-        pad_seqs = seq_bucket - actual_seqs
-        pad_tokens = token_bucket - actual_tokens
-        pad_lens = self._pad_lens(pad_seqs, pad_tokens, graph_vars["max_seqlen_q"]) if pad_seqs else []
+    def set_padded_decode_context(self, runtime_vars: dict[str, torch.Tensor]):
+        set_decode_context(
+            runtime_vars["slot_mapping"],
+            runtime_vars["cache_seqlens"],
+            runtime_vars["block_tables"],
+        )
 
+    def pad_subgraph_inputs(self, graph_vars: dict[str, torch.Tensor], input_ids: torch.Tensor, positions: torch.Tensor):
+        context = get_context()
+        actual_tokens = input_ids.size(0)
         graph_vars["input_ids"].zero_()
         graph_vars["positions"].zero_()
         graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["block_tables"].fill_(self.dummy_block_id)
         graph_vars["input_ids"][:actual_tokens].copy_(input_ids)
         graph_vars["positions"][:actual_tokens].copy_(positions)
         graph_vars["slot_mapping"][:actual_tokens].copy_(context.slot_mapping)
-        graph_vars["cu_seqlens_q"][:actual_seqs + 1].copy_(context.cu_seqlens_q)
-        graph_vars["cu_seqlens_k"][:actual_seqs + 1].copy_(context.cu_seqlens_k)
-        graph_vars["block_tables"][:actual_seqs, :context.block_tables.size(1)].copy_(context.block_tables)
 
-        if pad_lens:
-            pad_cu = self._cu_seqlens(pad_lens).cuda(non_blocking=True)[1:]
-            graph_vars["cu_seqlens_q"][actual_seqs + 1:].copy_(actual_tokens + pad_cu)
-            graph_vars["cu_seqlens_k"][actual_seqs + 1:].copy_(context.cu_seqlens_k[-1] + pad_cu)
-
-        set_varlen_context(
-            graph_vars["cu_seqlens_q"],
-            graph_vars["cu_seqlens_k"],
-            graph_vars["max_seqlen_q"],
-            graph_vars["max_seqlen_k"],
-            graph_vars["slot_mapping"],
-            graph_vars["block_tables"],
-        )
-
-    def get_full_decode_vars(self, key: tuple[int, int]):
-        if key in self.full_decode_graphs:
-            return self.full_decode_graphs[key][1]
-        config = self.config
-        hf_config = config.hf_config
-        seq_bucket, block_table_bucket = key
-        graph_vars = dict(
-            input_ids=torch.zeros(seq_bucket, dtype=torch.int64, device="cuda"),
-            positions=torch.zeros(seq_bucket, dtype=torch.int64, device="cuda"),
-            slot_mapping=torch.full((seq_bucket,), -1, dtype=torch.int32, device="cuda"),
-            cache_seqlens=torch.zeros(seq_bucket, dtype=torch.int32, device="cuda"),
-            block_tables=torch.full((seq_bucket, block_table_bucket), self.dummy_block_id, dtype=torch.int32, device="cuda"),
-            outputs=torch.empty(seq_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda"),
-        )
-        return graph_vars
-
-    def pad_full_decode_inputs(self, graph_vars: dict[str, torch.Tensor], input_ids: torch.Tensor, positions: torch.Tensor):
-        context = get_context()
-        bs = input_ids.size(0)
-        graph_vars["input_ids"].zero_()
-        graph_vars["positions"].zero_()
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["cache_seqlens"].zero_()
-        graph_vars["block_tables"].fill_(self.dummy_block_id)
-        graph_vars["input_ids"][:bs].copy_(input_ids)
-        graph_vars["positions"][:bs].copy_(positions)
-        graph_vars["slot_mapping"][:bs].copy_(context.slot_mapping)
-        graph_vars["cache_seqlens"][:bs].copy_(context.cache_seqlens)
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)].copy_(context.block_tables)
-
-    def set_full_decode_context(self, graph_vars: dict[str, torch.Tensor]):
-        set_decode_context(graph_vars["slot_mapping"], graph_vars["cache_seqlens"], graph_vars["block_tables"])
-
-    def capture_full_decode_graph(self, key: tuple[int, int]):
-        graph_vars = self.get_full_decode_vars(key)
-        graph = torch.cuda.CUDAGraph()
-        previous_context = get_context()
-        self.set_full_decode_context(graph_vars)
-        try:
-            graph_vars["outputs"].copy_(self.model(graph_vars["input_ids"], graph_vars["positions"]))
-            with torch.cuda.graph(graph, self.graph_pool):
-                graph_vars["outputs"].copy_(self.model(graph_vars["input_ids"], graph_vars["positions"]))
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            torch.cuda.synchronize()
-        finally:
-            set_context_obj(previous_context)
-        self.full_decode_graphs[key] = (graph, graph_vars)
-        return graph, graph_vars
-
-    def run_full_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        actual_context = get_context()
-        key = self.get_decode_graph_key(input_ids)
-        disabled_key = (RuntimeMode.FULL_DECODE, key)
-        if disabled_key in self.disabled_graphs:
-            return False, None
-        try:
-            graph, graph_vars = self.full_decode_graphs.get(key) or self.capture_full_decode_graph(key)
-            self.pad_full_decode_inputs(graph_vars, input_ids, positions)
-            self.set_full_decode_context(graph_vars)
-            graph.replay()
-        except Exception as exc:
-            self.disabled_graphs.add(disabled_key)
-            set_context_obj(actual_context)
-            if isinstance(exc, torch.cuda.OutOfMemoryError):
-                torch.cuda.empty_cache()
-            warnings.warn(f"CUDA graph disabled for bucket {key}: {exc}", RuntimeWarning)
-            return False, None
-        return True, graph_vars["outputs"][:input_ids.size(0)]
+        if context.attn_mode == "decode":
+            graph_vars["cache_seqlens"].zero_()
+            graph_vars["block_tables"].fill_(self.dummy_block_id)
+            graph_vars["cache_seqlens"][:actual_tokens].copy_(context.cache_seqlens)
+            graph_vars["block_tables"][:actual_tokens, :context.block_tables.size(1)].copy_(context.block_tables)
 
     def empty_piece_buffers(self, token_bucket: int):
         hf_config = self.config.hf_config
@@ -405,10 +292,28 @@ class ModelRunner:
             torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda"),
         )
 
-    def capture_piece0_graph(self, key: tuple[int, int, int, int], runtime_vars: dict[str, torch.Tensor]):
+    def capture_full_decode_graph(self, token_bucket: int, runtime_vars: dict[str, torch.Tensor]):
+        if token_bucket in self.full_decode_graphs:
+            return self.full_decode_graphs[token_bucket]
+        hf_config = self.config.hf_config
+        output_buf = torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        self.set_padded_decode_context(runtime_vars)
+        hidden_states = self.model(runtime_vars["input_ids"], runtime_vars["positions"])
+        output_buf.copy_(hidden_states)
+        with torch.cuda.graph(graph, self.graph_pool):
+            hidden_states = self.model(runtime_vars["input_ids"], runtime_vars["positions"])
+            output_buf.copy_(hidden_states)
+        if self.graph_pool is None:
+            self.graph_pool = graph.pool()
+        torch.cuda.synchronize()
+        self.full_decode_graphs[token_bucket] = (graph, output_buf)
+        return self.full_decode_graphs[token_bucket]
+
+    def capture_piece0_graph(self, key: int, runtime_vars: dict[str, torch.Tensor]):
         graph_key = ("piece0", key)
-        if graph_key in self.piecewise_graphs:
-            return self.piecewise_graphs[graph_key]
+        if graph_key in self.subgraph_graphs:
+            return self.subgraph_graphs[graph_key]
         token_bucket = runtime_vars["input_ids"].size(0)
         q_buf, k_buf, v_buf, residual_buf = self.empty_piece_buffers(token_bucket)
         graph = torch.cuda.CUDAGraph()
@@ -426,13 +331,13 @@ class ModelRunner:
         if self.graph_pool is None:
             self.graph_pool = graph.pool()
         torch.cuda.synchronize()
-        self.piecewise_graphs[graph_key] = (graph, (q_buf, k_buf, v_buf, residual_buf))
-        return self.piecewise_graphs[graph_key]
+        self.subgraph_graphs[graph_key] = (graph, (q_buf, k_buf, v_buf, residual_buf))
+        return self.subgraph_graphs[graph_key]
 
-    def capture_piece_next_graph(self, key: tuple[int, int, int, int], layer_idx: int, runtime_vars: dict[str, torch.Tensor]):
+    def capture_piece_next_graph(self, key: int, layer_idx: int, runtime_vars: dict[str, torch.Tensor]):
         graph_key = ("piece_next", layer_idx, key)
-        if graph_key in self.piecewise_graphs:
-            return self.piecewise_graphs[graph_key]
+        if graph_key in self.subgraph_graphs:
+            return self.subgraph_graphs[graph_key]
         token_bucket = runtime_vars["input_ids"].size(0)
         hf_config = self.config.hf_config
         attn = self.model.model.layers[layer_idx].self_attn
@@ -456,13 +361,13 @@ class ModelRunner:
         if self.graph_pool is None:
             self.graph_pool = graph.pool()
         torch.cuda.synchronize()
-        self.piecewise_graphs[graph_key] = (graph, attn_input, residual_input, (q_buf, k_buf, v_buf, residual_buf))
-        return self.piecewise_graphs[graph_key]
+        self.subgraph_graphs[graph_key] = (graph, attn_input, residual_input, (q_buf, k_buf, v_buf, residual_buf))
+        return self.subgraph_graphs[graph_key]
 
-    def capture_piece_last_graph(self, key: tuple[int, int, int, int], layer_idx: int, runtime_vars: dict[str, torch.Tensor]):
+    def capture_piece_last_graph(self, key: int, layer_idx: int, runtime_vars: dict[str, torch.Tensor]):
         graph_key = ("piece_last", layer_idx, key)
-        if graph_key in self.piecewise_graphs:
-            return self.piecewise_graphs[graph_key]
+        if graph_key in self.subgraph_graphs:
+            return self.subgraph_graphs[graph_key]
         token_bucket = runtime_vars["input_ids"].size(0)
         hf_config = self.config.hf_config
         attn = self.model.model.layers[layer_idx].self_attn
@@ -480,71 +385,85 @@ class ModelRunner:
         if self.graph_pool is None:
             self.graph_pool = graph.pool()
         torch.cuda.synchronize()
-        self.piecewise_graphs[graph_key] = (graph, attn_input, residual_input, output_buf)
-        return self.piecewise_graphs[graph_key]
+        self.subgraph_graphs[graph_key] = (graph, attn_input, residual_input, output_buf)
+        return self.subgraph_graphs[graph_key]
 
-    def ensure_piecewise_graphs(self, key: tuple[int, int, int, int], runtime_vars: dict[str, torch.Tensor]):
-        self.capture_piece0_graph(key, runtime_vars)
+    def capture_piecewise_graphs(self, token_bucket: int, runtime_vars: dict[str, torch.Tensor]):
+        self.capture_piece0_graph(token_bucket, runtime_vars)
         num_layers = len(self.model.model.layers)
         for layer_idx in range(num_layers - 1):
-            self.capture_piece_next_graph(key, layer_idx, runtime_vars)
-        self.capture_piece_last_graph(key, num_layers - 1, runtime_vars)
+            self.capture_piece_next_graph(token_bucket, layer_idx, runtime_vars)
+        self.capture_piece_last_graph(token_bucket, num_layers - 1, runtime_vars)
 
-    def release_piecewise_bucket(self, key: tuple[int, int, int, int]):
-        graph_keys = [graph_key for graph_key in self.piecewise_graphs if graph_key[-1] == key]
-        for graph_key in graph_keys:
-            del self.piecewise_graphs[graph_key]
-        self.piecewise_runtime_vars.pop(key, None)
-        gc.collect()
-        torch.cuda.empty_cache()
+    def has_piecewise_graphs(self, token_bucket: int) -> bool:
+        num_layers = len(self.model.model.layers)
+        if ("piece0", token_bucket) not in self.subgraph_graphs:
+            return False
+        for layer_idx in range(num_layers - 1):
+            if ("piece_next", layer_idx, token_bucket) not in self.subgraph_graphs:
+                return False
+        return ("piece_last", num_layers - 1, token_bucket) in self.subgraph_graphs
 
-    def piecewise_graph_allowed(self, key: tuple[int, int, int, int]):
-        limit = self.config.max_piecewise_cudagraph_tokens
-        return limit > 0 and key[1] <= limit
-
-    def run_piecewise_graph(self, input_ids: torch.Tensor, positions: torch.Tensor):
+    def run_full_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor):
         actual_context = get_context()
-        key = self.get_varlen_graph_key(input_ids)
-        disabled_key = (RuntimeMode.PIECEWISE, key)
-        if disabled_key in self.disabled_graphs:
+        token_bucket = self.get_cudagraph_token_bucket(input_ids)
+        if token_bucket not in self.full_decode_graphs:
             return False, None
-        if not self.piecewise_graph_allowed(key):
-            self.disabled_graphs.add(disabled_key)
-            warnings.warn(
-                f"Piecewise CUDA graph skipped for bucket {key}: token bucket exceeds "
-                f"max_piecewise_cudagraph_tokens={self.config.max_piecewise_cudagraph_tokens}",
-                RuntimeWarning,
-            )
-            return False, None
-        runtime_vars = self.get_piecewise_runtime_vars(key)
+        runtime_vars = self.subgraph_runtime_vars[token_bucket]
         try:
-            self.ensure_piecewise_graphs(key, runtime_vars)
-            self.pad_piecewise_inputs(runtime_vars, input_ids, positions)
-            graph, outputs = self.capture_piece0_graph(key, runtime_vars)
+            self.pad_subgraph_inputs(runtime_vars, input_ids, positions)
+            graph, hidden_states = self.full_decode_graphs[token_bucket]
+            self.set_padded_decode_context(runtime_vars)
+            graph.replay()
+        except Exception as exc:
+            set_context_obj(actual_context)
+            if isinstance(exc, torch.cuda.OutOfMemoryError):
+                self.full_decode_graphs.pop(token_bucket, None)
+                torch.cuda.empty_cache()
+            warnings.warn(f"Full decode CUDA graph disabled for token_bucket={token_bucket}: {exc}", RuntimeWarning)
+            return False, None
+        return True, hidden_states
+
+    def run_subgraph_forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        actual_context = get_context()
+        actual_tokens = input_ids.size(0)
+        token_bucket = self.get_cudagraph_token_bucket(input_ids)
+        if not self.has_piecewise_graphs(token_bucket):
+            return False, None
+        runtime_vars = self.subgraph_runtime_vars[token_bucket]
+        try:
+            self.pad_subgraph_inputs(runtime_vars, input_ids, positions)
+            graph, outputs = self.subgraph_graphs[("piece0", token_bucket)]
             graph.replay()
             q, k, v, residual = outputs
             num_layers = len(self.model.model.layers)
             for layer_idx, layer in enumerate(self.model.model.layers):
-                attn_output = layer.attention(q, k, v)
+                attn_output = layer.attention(q[:actual_tokens], k[:actual_tokens], v[:actual_tokens])
                 if layer_idx == num_layers - 1:
-                    graph, attn_input, residual_input, hidden_states = self.capture_piece_last_graph(key, layer_idx, runtime_vars)
-                    attn_input.copy_(attn_output)
-                    residual_input.copy_(residual)
+                    graph, attn_input, residual_input, hidden_states = self.subgraph_graphs[("piece_last", layer_idx, token_bucket)]
+                    attn_input.zero_()
+                    residual_input.zero_()
+                    attn_input[:actual_tokens].copy_(attn_output)
+                    residual_input[:actual_tokens].copy_(residual[:actual_tokens])
                     graph.replay()
                 else:
-                    graph, attn_input, residual_input, outputs = self.capture_piece_next_graph(key, layer_idx, runtime_vars)
-                    attn_input.copy_(attn_output)
-                    residual_input.copy_(residual)
+                    graph, attn_input, residual_input, outputs = self.subgraph_graphs[("piece_next", layer_idx, token_bucket)]
+                    attn_input.zero_()
+                    residual_input.zero_()
+                    attn_input[:actual_tokens].copy_(attn_output)
+                    residual_input[:actual_tokens].copy_(residual[:actual_tokens])
                     graph.replay()
                     q, k, v, residual = outputs
         except Exception as exc:
-            self.disabled_graphs.add(disabled_key)
             set_context_obj(actual_context)
             if isinstance(exc, torch.cuda.OutOfMemoryError):
-                runtime_vars = None
-                self.release_piecewise_bucket(key)
+                graph_keys = [graph_key for graph_key in self.subgraph_graphs if graph_key[-1] == token_bucket]
+                for graph_key in graph_keys:
+                    del self.subgraph_graphs[graph_key]
+                self.full_decode_graphs.pop(token_bucket, None)
+                self.subgraph_runtime_vars.pop(token_bucket, None)
                 torch.cuda.empty_cache()
-            warnings.warn(f"Piecewise CUDA graph disabled for bucket {key}: {exc}", RuntimeWarning)
+            warnings.warn(f"CUDA subgraph disabled for token_bucket={token_bucket}: {exc}", RuntimeWarning)
             return False, None
         return True, hidden_states
 
@@ -564,8 +483,8 @@ class ModelRunner:
             used_graph, hidden_states = self.run_full_decode_graph(input_ids, positions)
             if not used_graph:
                 hidden_states = self.model(input_ids, positions)
-        elif runtime_mode == RuntimeMode.PIECEWISE and get_context().block_tables is not None:
-            used_graph, hidden_states = self.run_piecewise_graph(input_ids, positions)
+        elif runtime_mode == RuntimeMode.PIECEWISE:
+            used_graph, hidden_states = self.run_subgraph_forward(input_ids, positions)
             if not used_graph:
                 hidden_states = self.run_piecewise_eager(input_ids, positions)
         else:
@@ -575,10 +494,13 @@ class ModelRunner:
             return None
         return self.model.compute_logits(hidden_states.index_select(0, sample_indices))
 
+    @staticmethod
+    def _use_decode_prepare(seqs: list[Sequence]) -> bool:
+        return eligible_full_decode_graph(seqs)
+
     def run(self, seqs: list[Sequence]) -> list[int]:
-        descriptor = BatchDescriptor.from_sequences(seqs)
-        runtime_mode = self.dispatcher.dispatch(descriptor)
-        if descriptor.is_uniform_decode:
+        runtime_mode = self.dispatcher.dispatch(seqs)
+        if self._use_decode_prepare(seqs):
             input_ids, positions, sample_indices = self.prepare_decode(seqs)
         else:
             input_ids, positions, sample_indices = self.prepare_mixed(seqs)
@@ -592,6 +514,19 @@ class ModelRunner:
     def capture_cudagraph(self):
         self.graph_pool = None
         self.full_decode_graphs = {}
-        self.piecewise_graphs = {}
-        self.piecewise_runtime_vars = {}
-        self.disabled_graphs = set()
+        self.subgraph_graphs = {}
+        self.subgraph_runtime_vars = {}
+        for token_bucket in self.get_cudagraph_capture_sizes():
+            runtime_vars = self.get_subgraph_runtime_vars(token_bucket)
+            try:
+                self.capture_full_decode_graph(token_bucket, runtime_vars)
+                self.capture_piecewise_graphs(token_bucket, runtime_vars)
+            except torch.cuda.OutOfMemoryError:
+                self.full_decode_graphs.pop(token_bucket, None)
+                graph_keys = [graph_key for graph_key in self.subgraph_graphs if graph_key[-1] == token_bucket]
+                for graph_key in graph_keys:
+                    del self.subgraph_graphs[graph_key]
+                self.subgraph_runtime_vars.pop(token_bucket, None)
+                torch.cuda.empty_cache()
+                warnings.warn(f"CUDA graph capture stopped at token_bucket={token_bucket}: out of memory", RuntimeWarning)
+                break

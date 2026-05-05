@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from nanovllm.engine.cudagraph import BatchDescriptor, CUDAGraphDispatcher, RuntimeMode
+from nanovllm.engine.cudagraph import CUDAGraphDispatcher, RuntimeMode
 from nanovllm.engine.sequence import Sequence
 from nanovllm.utils.context import reset_context, set_decode_context, set_varlen_context
 
@@ -19,29 +19,23 @@ class CUDAGraphDispatcherTest(unittest.TestCase):
         seq.num_cached_tokens = cached
         return seq
 
-    def test_full_and_piecewise_dispatches_decode_to_full_graph(self):
+    def test_dispatches_decode_to_full_graph(self):
         seqs = [self.make_seq(is_prefill=False, scheduled=1, cached=4) for _ in range(3)]
-        descriptor = BatchDescriptor.from_sequences(seqs)
 
-        self.assertTrue(descriptor.is_uniform_decode)
-        self.assertEqual(CUDAGraphDispatcher("full_and_piecewise").dispatch(descriptor), RuntimeMode.FULL_DECODE)
+        self.assertEqual(CUDAGraphDispatcher("full_and_piecewise").dispatch(seqs), RuntimeMode.FULL_DECODE)
 
-    def test_full_and_piecewise_dispatches_mixed_to_piecewise(self):
+    def test_dispatches_mixed_to_piecewise(self):
         seqs = [
             self.make_seq(is_prefill=False, scheduled=1, cached=4),
             self.make_seq(is_prefill=True, scheduled=3, cached=2),
         ]
-        descriptor = BatchDescriptor.from_sequences(seqs)
 
-        self.assertFalse(descriptor.is_uniform_decode)
-        self.assertEqual(descriptor.num_batched_tokens, 4)
-        self.assertEqual(CUDAGraphDispatcher("full_and_piecewise").dispatch(descriptor), RuntimeMode.PIECEWISE)
+        self.assertEqual(CUDAGraphDispatcher("full_and_piecewise").dispatch(seqs), RuntimeMode.PIECEWISE)
 
-    def test_full_decode_only_downgrades_prefill_to_eager(self):
+    def test_none_mode_dispatches_eager(self):
         seqs = [self.make_seq(is_prefill=True, scheduled=4, cached=0)]
-        descriptor = BatchDescriptor.from_sequences(seqs)
 
-        self.assertEqual(CUDAGraphDispatcher("full_decode_only").dispatch(descriptor), RuntimeMode.NONE)
+        self.assertEqual(CUDAGraphDispatcher("none").dispatch(seqs), RuntimeMode.NONE)
 
 
 class AttentionModeTest(unittest.TestCase):
