@@ -273,7 +273,7 @@ def parse_args():
     parser.add_argument("--max-requests", type=int, default=0, help="Optional cap for generated requests in duration mode. 0 means unlimited.")
     parser.add_argument("--request-rate", type=float, default=8.0, help="Poisson arrival rate in requests/s. Use 0 for a burst.")
     parser.add_argument("--min-input-len", type=int, default=100)
-    parser.add_argument("--max-input-len", type=int, default=4096)
+    parser.add_argument("--max-input-len", type=int, default=2048)
     parser.add_argument("--min-output-len", type=int, default=100)
     parser.add_argument("--max-output-len", type=int, default=512)
     parser.add_argument("--length-distribution", choices=["uniform", "lognormal"], default="lognormal")
