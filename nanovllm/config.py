@@ -15,7 +15,7 @@ class Config:
     enforce_eager: bool = False
     cudagraph_mode: str = "full_and_piecewise"
     cudagraph_capture_sizes: list[int] | None = None
-    max_cudagraph_capture_tokens: int = 32
+    max_cudagraph_capture_tokens: int = 512
     hf_config: Any | None = None
     eos: int = -1
     kvcache_block_size: int = 256

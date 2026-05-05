@@ -34,6 +34,10 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.graph_pool = None
+        self.full_decode_graphs = {}
+        self.subgraph_graphs = {}
+        self.subgraph_runtime_vars = {}
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -260,10 +264,11 @@ class ModelRunner:
         return graph_vars
 
     def set_padded_decode_context(self, runtime_vars: dict[str, torch.Tensor]):
+        token_bucket = runtime_vars["input_ids"].size(0)
         set_decode_context(
             runtime_vars["slot_mapping"],
             runtime_vars["cache_seqlens"],
-            runtime_vars["block_tables"],
+            runtime_vars["block_tables"][:token_bucket],
         )
 
     def pad_subgraph_inputs(self, graph_vars: dict[str, torch.Tensor], input_ids: torch.Tensor, positions: torch.Tensor):
@@ -396,6 +401,11 @@ class ModelRunner:
         self.capture_piece_last_graph(token_bucket, num_layers - 1, runtime_vars)
 
     def has_piecewise_graphs(self, token_bucket: int) -> bool:
+        if not hasattr(self, 'subgraph_graphs'):
+            return False
+        num_layers = len(self.model.model.layers)
+        if ("piece0", token_bucket) not in self.subgraph_graphs:
+            return False
         num_layers = len(self.model.model.layers)
         if ("piece0", token_bucket) not in self.subgraph_graphs:
             return False
