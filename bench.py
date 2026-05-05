@@ -69,16 +69,18 @@ def build_arrivals(num_requests: int, request_rate: float) -> list[float]:
 def build_online_workload(args):
     random.seed(args.seed)
     if args.duration <= 0:
-        arrivals = build_arrivals(args.num_seqs, args.request_rate)
-        prompt_token_ids, sampling_params = build_requests(args, args.num_seqs)
+        num_requests = args.num_seqs
+        arrivals = build_arrivals(num_requests, args.request_rate)
+        prompt_token_ids, sampling_params = build_requests(args, num_requests)
         return arrivals, prompt_token_ids, sampling_params
 
     if args.request_rate <= 0:
-        arrivals = [0.0] * args.num_seqs
+        num_requests = args.max_requests or args.num_seqs
+        arrivals = [0.0] * num_requests
     else:
         arrivals = []
         next_arrival = 0.0
-        while next_arrival < args.duration:
+        while next_arrival < args.duration and (args.max_requests <= 0 or len(arrivals) < args.max_requests):
             arrivals.append(next_arrival)
             next_arrival += random.expovariate(args.request_rate)
     prompt_token_ids, sampling_params = build_requests(args, len(arrivals))
@@ -221,6 +223,7 @@ def run_online(args):
 
     states: dict[int, RequestState] = {}
     next_request = 0
+    total_requests = len(arrivals)
     total_prefill_tokens = 0
     total_decode_tokens = 0
     busy_time = 0.0
@@ -228,10 +231,10 @@ def run_online(args):
     if args.profile:
         torch.cuda.cudart().cudaProfilerStart()
     start = time.perf_counter()
-    while next_request < args.num_seqs or not llm.is_finished():
+    while next_request < total_requests or not llm.is_finished():
         now = time.perf_counter()
         elapsed = now - start
-        while next_request < args.num_seqs and arrivals[next_request] <= elapsed:
+        while next_request < total_requests and arrivals[next_request] <= elapsed:
             seq_id = llm.add_request(prompt_token_ids[next_request], sampling_params[next_request])
             states[seq_id] = RequestState(
                 index=next_request,
@@ -242,7 +245,7 @@ def run_online(args):
             next_request += 1
 
         if llm.is_finished():
-            if next_request < args.num_seqs:
+            if next_request < total_requests:
                 sleep_time = start + arrivals[next_request] - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -265,20 +268,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="nano-vLLM offline and online benchmark")
     parser.add_argument("--mode", choices=["online", "offline"], default="online")
     parser.add_argument("--model", default="~/autodl-tmp/huggingface/Qwen3-8B/")
-    parser.add_argument("--num-seqs", type=int, default=256)
-    parser.add_argument("--duration", type=float, default=60, help="Open-loop online load duration in seconds. 0 keeps the fixed --num-seqs workload.")
-    parser.add_argument("--request-rate", type=float, default=32.0, help="Poisson arrival rate in requests/s. Use 0 for a burst.")
+    parser.add_argument("--num-seqs", type=int, default=256, help="Number of requests when --duration is 0, or burst size when --duration > 0 and --request-rate is 0.")
+    parser.add_argument("--duration", type=float, default=60.0, help="Open-loop online load duration in seconds. 0 uses the fixed --num-seqs workload.")
+    parser.add_argument("--max-requests", type=int, default=0, help="Optional cap for generated requests in duration mode. 0 means unlimited.")
+    parser.add_argument("--request-rate", type=float, default=8.0, help="Poisson arrival rate in requests/s. Use 0 for a burst.")
     parser.add_argument("--min-input-len", type=int, default=100)
     parser.add_argument("--max-input-len", type=int, default=4096)
     parser.add_argument("--min-output-len", type=int, default=100)
-    parser.add_argument("--max-output-len", type=int, default=1024)
+    parser.add_argument("--max-output-len", type=int, default=512)
     parser.add_argument("--length-distribution", choices=["uniform", "lognormal"], default="lognormal")
     parser.add_argument("--vocab-range", type=int, default=10000)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
-    parser.add_argument("--max-chunked-prefill-tokens", type=int, default=2048)
+    parser.add_argument("--max-chunked-prefill-tokens", type=int, default=1024)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--cudagraph-mode", default="full_and_piecewise", choices=["none", "full_decode_only", "piecewise", "full_and_piecewise"])
