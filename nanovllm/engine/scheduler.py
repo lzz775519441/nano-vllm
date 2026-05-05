@@ -23,11 +23,9 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.max_num_mixed_prefill_tokens = getattr(config, "max_num_mixed_prefill_tokens", self.max_num_batched_tokens)
-        self.max_prefill_chunk_tokens = self.max_num_batched_tokens
-        if not getattr(config, "enforce_eager", False) and getattr(config, "cudagraph_mode", "none") != "none":
-            capture_limit = getattr(config, "max_cudagraph_capture_tokens", 0)
-            if capture_limit > 0:
-                self.max_prefill_chunk_tokens = min(self.max_prefill_chunk_tokens, capture_limit)
+        self.max_prefill_chunk_tokens = getattr(config, "max_prefill_chunk_tokens", self.max_num_batched_tokens)
+        if self.max_prefill_chunk_tokens <= 0:
+            self.max_prefill_chunk_tokens = self.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -71,7 +69,8 @@ class Scheduler:
         # running requests are not hidden behind a very large prefill chunk.
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            remaining = min(remaining, self.max_prefill_chunk_tokens - num_batched_tokens)
+            prefill_remaining = self.max_prefill_chunk_tokens - num_prefill_tokens
+            remaining = min(remaining, prefill_remaining)
             if num_decode_tokens > 0:
                 mixed_prefill_remaining = self.max_num_mixed_prefill_tokens - num_prefill_tokens
                 remaining = min(remaining, mixed_prefill_remaining)

@@ -63,10 +63,12 @@ def make_llm(args):
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_mixed_prefill_tokens=args.max_num_mixed_prefill_tokens,
+        max_prefill_chunk_tokens=args.max_prefill_chunk_tokens,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         cudagraph_mode=args.cudagraph_mode,
-        max_cudagraph_capture_tokens=args.max_cudagraph_capture_tokens,
+        max_decode_cudagraph_tokens=args.max_decode_cudagraph_tokens,
+        max_piecewise_cudagraph_tokens=args.max_piecewise_cudagraph_tokens,
     )
 
 
@@ -236,11 +238,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
-    parser.add_argument("--max-num-mixed-prefill-tokens", type=int, default=2048)
+    parser.add_argument("--max-num-mixed-prefill-tokens", type=int, default=512)
+    parser.add_argument("--max-prefill-chunk-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--cudagraph-mode", default="full_and_piecewise", choices=["none", "full_decode_only", "piecewise", "full_and_piecewise"])
-    parser.add_argument("--max-cudagraph-capture-tokens", type=int, default=512)
+    parser.add_argument("--max-decode-cudagraph-tokens", type=int, default=512)
+    parser.add_argument("--max-piecewise-cudagraph-tokens", type=int, default=320)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--profile", action="store_true")
     return parser.parse_args()

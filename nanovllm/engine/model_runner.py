@@ -233,17 +233,14 @@ class ModelRunner:
         """Single capture key dimension (vLLM-style): padded total token count only."""
         return self._round_bucket(input_ids.size(0))
 
-    def get_cudagraph_capture_sizes(self) -> list[int]:
-        limit = self.config.max_cudagraph_capture_tokens
+    def get_cudagraph_capture_sizes(self, limit: int) -> list[int]:
         if limit <= 0:
             return []
-        sizes = self.config.cudagraph_capture_sizes
-        if sizes is None:
-            sizes = [1, 2, 4, 8]
-            size = 16
-            while size <= limit:
-                sizes.append(size)
-                size += 16
+        sizes = [1, 2, 4, 8]
+        size = 16
+        while size <= limit:
+            sizes.append(size)
+            size += 16
         buckets = {self._round_bucket(size) for size in sizes if size <= limit}
         return sorted(buckets)
 
@@ -406,9 +403,6 @@ class ModelRunner:
         num_layers = len(self.model.model.layers)
         if ("piece0", token_bucket) not in self.subgraph_graphs:
             return False
-        num_layers = len(self.model.model.layers)
-        if ("piece0", token_bucket) not in self.subgraph_graphs:
-            return False
         for layer_idx in range(num_layers - 1):
             if ("piece_next", layer_idx, token_bucket) not in self.subgraph_graphs:
                 return False
@@ -526,17 +520,27 @@ class ModelRunner:
         self.full_decode_graphs = {}
         self.subgraph_graphs = {}
         self.subgraph_runtime_vars = {}
-        for token_bucket in self.get_cudagraph_capture_sizes():
+        for token_bucket in self.get_cudagraph_capture_sizes(self.config.max_decode_cudagraph_tokens):
             runtime_vars = self.get_subgraph_runtime_vars(token_bucket)
             try:
                 self.capture_full_decode_graph(token_bucket, runtime_vars)
-                self.capture_piecewise_graphs(token_bucket, runtime_vars)
             except torch.cuda.OutOfMemoryError:
                 self.full_decode_graphs.pop(token_bucket, None)
+                self.subgraph_runtime_vars.pop(token_bucket, None)
+                torch.cuda.empty_cache()
+                warnings.warn(f"Full decode CUDA graph capture stopped at token_bucket={token_bucket}: out of memory", RuntimeWarning)
+                break
+
+        for token_bucket in self.get_cudagraph_capture_sizes(self.config.max_piecewise_cudagraph_tokens):
+            runtime_vars = self.get_subgraph_runtime_vars(token_bucket)
+            try:
+                self.capture_piecewise_graphs(token_bucket, runtime_vars)
+            except torch.cuda.OutOfMemoryError:
                 graph_keys = [graph_key for graph_key in self.subgraph_graphs if graph_key[-1] == token_bucket]
                 for graph_key in graph_keys:
                     del self.subgraph_graphs[graph_key]
-                self.subgraph_runtime_vars.pop(token_bucket, None)
+                if token_bucket not in self.full_decode_graphs:
+                    self.subgraph_runtime_vars.pop(token_bucket, None)
                 torch.cuda.empty_cache()
-                warnings.warn(f"CUDA graph capture stopped at token_bucket={token_bucket}: out of memory", RuntimeWarning)
+                warnings.warn(f"Piecewise CUDA graph capture stopped at token_bucket={token_bucket}: out of memory", RuntimeWarning)
                 break
