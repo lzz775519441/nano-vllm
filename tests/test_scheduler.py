@@ -20,14 +20,10 @@ class SchedulerTest(unittest.TestCase):
         max_tokens=4,
         max_seqs=8,
         num_blocks=16,
-        max_chunked_prefill_tokens=None,
     ):
-        if max_chunked_prefill_tokens is None:
-            max_chunked_prefill_tokens = max_tokens
         config = SimpleNamespace(
             max_num_seqs=max_seqs,
             max_num_batched_tokens=max_tokens,
-            max_chunked_prefill_tokens=max_chunked_prefill_tokens,
             eos=-1,
             kvcache_block_size=Sequence.block_size,
             num_kvcache_blocks=num_blocks,
@@ -104,33 +100,8 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(running.completion_token_ids, [4, 50])
         self.assertEqual(waiting.completion_token_ids, [60])
 
-    def test_decode_tokens_are_subtracted_from_chunked_prefill_budget(self):
-        scheduler = self.make_scheduler(max_tokens=8, max_chunked_prefill_tokens=3)
-        running = self.make_running(scheduler, [1, 2, 3], 4)
-        waiting = Sequence([10, 11, 12, 13, 14])
-        scheduler.add(waiting)
-
-        output = scheduler.schedule()
-
-        self.assertEqual(output.seqs, [running, waiting])
-        self.assertEqual(output.num_decode_tokens, 1)
-        self.assertEqual(output.num_prefill_tokens, 2)
-        self.assertEqual(waiting.num_scheduled_tokens, 2)
-        self.assertEqual(waiting.status, SequenceStatus.WAITING)
-
-    def test_chunked_prefill_budget_caps_prefill_chunk(self):
-        scheduler = self.make_scheduler(max_tokens=8, max_chunked_prefill_tokens=4)
-        seq = Sequence([1, 2, 3, 4, 5, 6, 7])
-        scheduler.add(seq)
-
-        output = scheduler.schedule()
-
-        self.assertEqual(output.num_prefill_tokens, 4)
-        self.assertEqual(seq.num_scheduled_tokens, 4)
-        self.assertEqual(seq.status, SequenceStatus.WAITING)
-
-    def test_chunked_prefill_budget_caps_mixed_batch_total(self):
-        scheduler = self.make_scheduler(max_tokens=8, max_chunked_prefill_tokens=4)
+    def test_prefill_uses_remaining_token_budget_after_decode(self):
+        scheduler = self.make_scheduler(max_tokens=4)
         running = self.make_running(scheduler, [1, 2, 3], 4)
         waiting = Sequence([10, 11, 12, 13, 14])
         scheduler.add(waiting)

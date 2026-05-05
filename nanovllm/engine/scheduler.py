@@ -22,9 +22,6 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
-        self.max_chunked_prefill_tokens = getattr(config, "max_chunked_prefill_tokens", self.max_num_batched_tokens)
-        if self.max_chunked_prefill_tokens <= 0:
-            self.max_chunked_prefill_tokens = self.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -64,12 +61,10 @@ class Scheduler:
                 continue
             break
 
-        # Prefill chunk size is the remaining room in a single token budget
-        # after already-scheduled decode tokens have been placed first.
+        # Prefill uses whatever room remains in the same token budget after
+        # already-scheduled decode tokens have been placed first.
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            chunk_remaining = self.max_chunked_prefill_tokens - num_decode_tokens - num_prefill_tokens
-            remaining = min(remaining, chunk_remaining)
             if remaining <= 0:
                 break
             seq = self.waiting[0]
