@@ -18,6 +18,19 @@ class RequestState:
     actual_output_len: int = 0
 
 
+def sample_length(min_len: int, max_len: int, distribution: str) -> int:
+    if min_len >= max_len:
+        return min_len
+    if distribution == "lognormal":
+        # A simple long-tail distribution: most requests are short/medium, with
+        # occasional long prompts or generations near the configured maximum.
+        span = max_len - min_len
+        value = random.lognormvariate(0.0, 1.0)
+        normalized = min(value / 8.0, 1.0)
+        return min_len + int(normalized * span)
+    return random.randint(min_len, max_len)
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -26,21 +39,20 @@ def percentile(values: list[float], pct: float) -> float:
     return values[idx]
 
 
-def build_requests(args):
+def build_requests(args, num_requests: int):
     from nanovllm import SamplingParams
 
-    random.seed(args.seed)
     prompt_token_ids = [
-        [random.randint(0, args.vocab_range) for _ in range(random.randint(args.min_input_len, args.max_input_len))]
-        for _ in range(args.num_seqs)
+        [random.randint(0, args.vocab_range) for _ in range(sample_length(args.min_input_len, args.max_input_len, args.length_distribution))]
+        for _ in range(num_requests)
     ]
     sampling_params = [
         SamplingParams(
             temperature=args.temperature,
             ignore_eos=True,
-            max_tokens=random.randint(args.min_output_len, args.max_output_len),
+            max_tokens=sample_length(args.min_output_len, args.max_output_len, args.length_distribution),
         )
-        for _ in range(args.num_seqs)
+        for _ in range(num_requests)
     ]
     return prompt_token_ids, sampling_params
 
@@ -52,6 +64,25 @@ def build_arrivals(num_requests: int, request_rate: float) -> list[float]:
     for _ in range(1, num_requests):
         arrivals.append(arrivals[-1] + random.expovariate(request_rate))
     return arrivals
+
+
+def build_online_workload(args):
+    random.seed(args.seed)
+    if args.duration <= 0:
+        arrivals = build_arrivals(args.num_seqs, args.request_rate)
+        prompt_token_ids, sampling_params = build_requests(args, args.num_seqs)
+        return arrivals, prompt_token_ids, sampling_params
+
+    if args.request_rate <= 0:
+        arrivals = [0.0] * args.num_seqs
+    else:
+        arrivals = []
+        next_arrival = 0.0
+        while next_arrival < args.duration:
+            arrivals.append(next_arrival)
+            next_arrival += random.expovariate(args.request_rate)
+    prompt_token_ids, sampling_params = build_requests(args, len(arrivals))
+    return arrivals, prompt_token_ids, sampling_params
 
 
 def make_llm(args):
@@ -79,7 +110,8 @@ def warmup(llm):
 
 
 def run_offline(args):
-    prompt_token_ids, sampling_params = build_requests(args)
+    random.seed(args.seed)
+    prompt_token_ids, sampling_params = build_requests(args, args.num_seqs)
     llm = make_llm(args)
     warmup(llm)
 
@@ -146,11 +178,16 @@ def run_online_step(llm, states: dict[int, RequestState]):
     return num_prefill_tokens, num_decode_tokens, step_end - step_start
 
 
-def print_online_report(states: dict[int, RequestState], wall_time: float, busy_time: float, prefill_tokens: int, decode_tokens: int):
+def print_online_report(states: dict[int, RequestState], wall_time: float, busy_time: float, prefill_tokens: int, decode_tokens: int, arrivals: list[float]):
     requests = list(states.values())
     completed = [state for state in requests if state.finish_time is not None]
     ttfts = [state.first_token_time - state.arrival_time for state in completed if state.first_token_time is not None]
     latencies = [state.finish_time - state.arrival_time for state in completed]
+    service_times = [
+        state.finish_time - state.first_token_time
+        for state in completed
+        if state.first_token_time is not None
+    ]
     output_tokens = sum(state.actual_output_len for state in completed)
     prompt_tokens = sum(state.prompt_len for state in completed)
     tpots = [
@@ -161,6 +198,8 @@ def print_online_report(states: dict[int, RequestState], wall_time: float, busy_
 
     print("Online benchmark")
     print(f"Completed requests: {len(completed)}/{len(requests)}")
+    if arrivals:
+        print(f"Arrival span/rate: {arrivals[-1]:.2f}s / {len(arrivals) / max(arrivals[-1], 1e-9):.2f} req/s")
     print(f"Wall time: {wall_time:.2f}s")
     print(f"Engine busy: {busy_time:.2f}s ({busy_time / wall_time * 100:.1f}%)")
     print(f"Prompt tokens: {prompt_tokens}")
@@ -170,13 +209,13 @@ def print_online_report(states: dict[int, RequestState], wall_time: float, busy_
     print(f"Output throughput: {output_tokens / wall_time:.2f} tok/s")
     print(f"Total scheduled throughput: {(prefill_tokens + decode_tokens) / wall_time:.2f} tok/s")
     print(f"TTFT p50/p90/p99: {percentile(ttfts, 50):.3f}s / {percentile(ttfts, 90):.3f}s / {percentile(ttfts, 99):.3f}s")
+    print(f"Service p50/p90/p99: {percentile(service_times, 50):.3f}s / {percentile(service_times, 90):.3f}s / {percentile(service_times, 99):.3f}s")
     print(f"Latency p50/p90/p99: {percentile(latencies, 50):.3f}s / {percentile(latencies, 90):.3f}s / {percentile(latencies, 99):.3f}s")
     print(f"TPOT p50/p90/p99: {percentile(tpots, 50) * 1000:.2f}ms / {percentile(tpots, 90) * 1000:.2f}ms / {percentile(tpots, 99) * 1000:.2f}ms")
 
 
 def run_online(args):
-    prompt_token_ids, sampling_params = build_requests(args)
-    arrivals = build_arrivals(args.num_seqs, args.request_rate)
+    arrivals, prompt_token_ids, sampling_params = build_online_workload(args)
     llm = make_llm(args)
     warmup(llm)
 
@@ -219,7 +258,7 @@ def run_online(args):
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
 
-    print_online_report(states, wall_time, busy_time, total_prefill_tokens, total_decode_tokens)
+    print_online_report(states, wall_time, busy_time, total_prefill_tokens, total_decode_tokens, arrivals)
 
 
 def parse_args():
@@ -227,11 +266,13 @@ def parse_args():
     parser.add_argument("--mode", choices=["online", "offline"], default="online")
     parser.add_argument("--model", default="~/autodl-tmp/huggingface/Qwen3-8B/")
     parser.add_argument("--num-seqs", type=int, default=256)
+    parser.add_argument("--duration", type=float, default=60, help="Open-loop online load duration in seconds. 0 keeps the fixed --num-seqs workload.")
     parser.add_argument("--request-rate", type=float, default=32.0, help="Poisson arrival rate in requests/s. Use 0 for a burst.")
     parser.add_argument("--min-input-len", type=int, default=100)
-    parser.add_argument("--max-input-len", type=int, default=1024)
+    parser.add_argument("--max-input-len", type=int, default=4096)
     parser.add_argument("--min-output-len", type=int, default=100)
     parser.add_argument("--max-output-len", type=int, default=1024)
+    parser.add_argument("--length-distribution", choices=["uniform", "lognormal"], default="lognormal")
     parser.add_argument("--vocab-range", type=int, default=10000)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--seed", type=int, default=0)
