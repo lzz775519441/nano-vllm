@@ -263,14 +263,14 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=1280)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-decode-cudagraph-tokens", type=int, default=512)
-    parser.add_argument("--max-piecewise-cudagraph-tokens", type=int, default=320)
+    parser.add_argument("--max-piecewise-cudagraph-tokens", type=int, default=256)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.84)
     return parser.parse_args()
 
 
