@@ -97,7 +97,6 @@ def make_llm(args):
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
-        cudagraph_mode=args.cudagraph_mode,
         max_decode_cudagraph_tokens=args.max_decode_cudagraph_tokens,
         max_piecewise_cudagraph_tokens=args.max_piecewise_cudagraph_tokens,
     )
@@ -139,29 +138,12 @@ def run_offline(args):
 def run_online_step(llm, states: dict[int, RequestState]):
     step_start = time.perf_counter()
     scheduler_output = llm.scheduler.schedule()
-    if hasattr(scheduler_output, "seqs"):
-        seqs = scheduler_output.seqs
-        sampled_seq_ids = [seq.seq_id for seq in seqs if seq.needs_sampling]
-        token_ids = llm.model_runner.call("run", seqs, scheduler_output.is_decode)
-        llm.scheduler.postprocess(scheduler_output, token_ids)
-        num_prefill_tokens = scheduler_output.num_prefill_tokens
-        num_decode_tokens = scheduler_output.num_decode_tokens
-    else:
-        seqs, is_prefill = scheduler_output
-        if is_prefill:
-            sampled_seq_ids = [
-                seq.seq_id
-                for seq in seqs
-                if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens
-            ]
-            num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
-            num_decode_tokens = 0
-        else:
-            sampled_seq_ids = [seq.seq_id for seq in seqs]
-            num_prefill_tokens = 0
-            num_decode_tokens = len(seqs)
-        token_ids = llm.model_runner.call("run", seqs, not is_prefill)
-        llm.scheduler.postprocess(seqs, token_ids, is_prefill)
+    seqs = scheduler_output.seqs
+    sampled_seq_ids = [seq.seq_id for seq in seqs if seq.needs_sampling]
+    token_ids = llm.model_runner.call("run", seqs, scheduler_output.is_decode)
+    llm.scheduler.postprocess(scheduler_output, token_ids)
+    num_prefill_tokens = scheduler_output.num_prefill_tokens
+    num_decode_tokens = scheduler_output.num_decode_tokens
     step_end = time.perf_counter()
 
     for seq_id in sampled_seq_ids:
@@ -283,7 +265,6 @@ def parse_args():
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--cudagraph-mode", default="full_and_piecewise", choices=["none", "full_and_piecewise"])
     parser.add_argument("--max-decode-cudagraph-tokens", type=int, default=512)
     parser.add_argument("--max-piecewise-cudagraph-tokens", type=int, default=320)
     parser.add_argument("--enforce-eager", action="store_true")

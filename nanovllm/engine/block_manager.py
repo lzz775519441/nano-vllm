@@ -1,11 +1,6 @@
 from collections import deque
-from array import array
-import hashlib
-
-try:
-    import xxhash
-except ModuleNotFoundError:
-    xxhash = None
+import xxhash
+import numpy as np
 
 from nanovllm.engine.sequence import Sequence
 
@@ -39,17 +34,10 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        token_bytes = array("q", token_ids).tobytes()
-        if xxhash is None:
-            h = hashlib.blake2b(digest_size=8)
-            if prefix != -1:
-                h.update(prefix.to_bytes(8, "little"))
-            h.update(token_bytes)
-            return int.from_bytes(h.digest(), "little")
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(token_bytes)
+        h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
     def _allocate_block(self) -> int:

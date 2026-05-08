@@ -20,7 +20,6 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.cudagraph_mode = "none" if config.enforce_eager else config.cudagraph_mode
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -464,34 +463,29 @@ class ModelRunner:
         return hidden_states
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, sample_indices: torch.Tensor, runtime_mode: str):
-        if runtime_mode == "full_decode":
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, sample_indices: torch.Tensor, is_decode: bool):
+        if self.enforce_eager:
+            hidden_states = self.model(input_ids, positions)
+        elif is_decode:
             hidden_states = self.run_full_decode_graph(input_ids, positions)
             if hidden_states is None:
                 hidden_states = self.model(input_ids, positions)
-        elif runtime_mode == "piecewise":
+        else:
             hidden_states = self.run_piecewise_graph(input_ids, positions)
             if hidden_states is None:
                 hidden_states = self.model(input_ids, positions)
-        else:
-            hidden_states = self.model(input_ids, positions)
 
         if sample_indices.numel() == 0:
             return None
         return self.model.compute_logits(hidden_states.index_select(0, sample_indices))
 
     def run(self, seqs: list[Sequence], is_decode: bool) -> list[int]:
-        if self.cudagraph_mode == "none":
-            runtime_mode = "none"
-        else:
-            runtime_mode = "full_decode" if is_decode else "piecewise"
-
         if is_decode:
             input_ids, positions, sample_indices = self.prepare_decode(seqs)
         else:
             input_ids, positions, sample_indices = self.prepare_mixed(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, sample_indices, runtime_mode)
+        logits = self.run_model(input_ids, positions, sample_indices, is_decode)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 and logits is not None else []
         reset_context()
         return token_ids
