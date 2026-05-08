@@ -96,6 +96,7 @@ def make_llm(args):
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         max_decode_cudagraph_tokens=args.max_decode_cudagraph_tokens,
         max_piecewise_cudagraph_tokens=args.max_piecewise_cudagraph_tokens,
@@ -269,6 +270,7 @@ def parse_args():
     parser.add_argument("--max-piecewise-cudagraph-tokens", type=int, default=320)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     return parser.parse_args()
 
 
