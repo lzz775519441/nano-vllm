@@ -16,6 +16,10 @@ class SchedulerOutput:
     def num_batched_tokens(self):
         return self.num_prefill_tokens + self.num_decode_tokens
 
+    @property
+    def is_decode(self):
+        return self.num_prefill_tokens == 0
+
 
 class Scheduler:
 

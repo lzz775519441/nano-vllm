@@ -24,7 +24,7 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        assert self.cudagraph_mode in {"none", "full_decode_only", "piecewise", "full_and_piecewise"}
+        assert self.cudagraph_mode in {"none", "full_and_piecewise"}
         assert self.max_decode_cudagraph_tokens >= 0
         assert self.max_piecewise_cudagraph_tokens >= 0
         from transformers import AutoConfig

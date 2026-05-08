@@ -49,7 +49,7 @@ class LLMEngine:
 
     def step(self):
         scheduler_output = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", scheduler_output.seqs)
+        token_ids = self.model_runner.call("run", scheduler_output.seqs, scheduler_output.is_decode)
         self.scheduler.postprocess(scheduler_output, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduler_output.seqs if seq.is_finished]
         return outputs, scheduler_output.num_prefill_tokens, scheduler_output.num_decode_tokens

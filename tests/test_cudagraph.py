@@ -5,37 +5,7 @@ import unittest
 
 import torch
 
-from nanovllm.engine.cudagraph import CUDAGraphDispatcher, RuntimeMode
-from nanovllm.engine.sequence import Sequence
 from nanovllm.utils.context import reset_context, set_decode_context, set_varlen_context
-
-
-class CUDAGraphDispatcherTest(unittest.TestCase):
-
-    def make_seq(self, *, is_prefill: bool, scheduled: int, cached: int = 0):
-        seq = Sequence([1, 2, 3, 4])
-        seq.is_prefill = is_prefill
-        seq.num_scheduled_tokens = scheduled
-        seq.num_cached_tokens = cached
-        return seq
-
-    def test_dispatches_decode_to_full_graph(self):
-        seqs = [self.make_seq(is_prefill=False, scheduled=1, cached=4) for _ in range(3)]
-
-        self.assertEqual(CUDAGraphDispatcher("full_and_piecewise").dispatch(seqs), RuntimeMode.FULL_DECODE)
-
-    def test_dispatches_mixed_to_piecewise(self):
-        seqs = [
-            self.make_seq(is_prefill=False, scheduled=1, cached=4),
-            self.make_seq(is_prefill=True, scheduled=3, cached=2),
-        ]
-
-        self.assertEqual(CUDAGraphDispatcher("full_and_piecewise").dispatch(seqs), RuntimeMode.PIECEWISE)
-
-    def test_none_mode_dispatches_eager(self):
-        seqs = [self.make_seq(is_prefill=True, scheduled=4, cached=0)]
-
-        self.assertEqual(CUDAGraphDispatcher("none").dispatch(seqs), RuntimeMode.NONE)
 
 
 class AttentionModeTest(unittest.TestCase):

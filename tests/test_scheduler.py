@@ -51,6 +51,7 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(output.seqs, [running, waiting])
         self.assertEqual(output.num_decode_tokens, 1)
         self.assertEqual(output.num_prefill_tokens, 3)
+        self.assertFalse(output.is_decode)
         self.assertEqual(running.num_scheduled_tokens, 1)
         self.assertEqual(waiting.num_scheduled_tokens, 3)
         self.assertEqual(waiting.status, SequenceStatus.WAITING)
@@ -123,9 +124,21 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(output.seqs, [running])
         self.assertEqual(output.num_decode_tokens, 0)
         self.assertEqual(output.num_prefill_tokens, 4)
+        self.assertFalse(output.is_decode)
         self.assertEqual(running.status, SequenceStatus.WAITING)
         self.assertTrue(running.is_prefill)
         self.assertEqual(running.num_cached_tokens, 0)
+
+    def test_decode_only_output_is_marked_decode(self):
+        scheduler = self.make_scheduler(max_tokens=4)
+        running = self.make_running(scheduler, [1, 2, 3], 4)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.seqs, [running])
+        self.assertEqual(output.num_decode_tokens, 1)
+        self.assertEqual(output.num_prefill_tokens, 0)
+        self.assertTrue(output.is_decode)
 
     def test_decode_pickle_keeps_scheduled_kind_and_last_token(self):
         scheduler = self.make_scheduler()
