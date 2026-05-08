@@ -142,7 +142,7 @@ def run_online_step(llm, states: dict[int, RequestState]):
     if hasattr(scheduler_output, "seqs"):
         seqs = scheduler_output.seqs
         sampled_seq_ids = [seq.seq_id for seq in seqs if seq.needs_sampling]
-        token_ids = llm.model_runner.call("run", seqs)
+        token_ids = llm.model_runner.call("run", seqs, scheduler_output.is_decode)
         llm.scheduler.postprocess(scheduler_output, token_ids)
         num_prefill_tokens = scheduler_output.num_prefill_tokens
         num_decode_tokens = scheduler_output.num_decode_tokens
@@ -160,7 +160,7 @@ def run_online_step(llm, states: dict[int, RequestState]):
             sampled_seq_ids = [seq.seq_id for seq in seqs]
             num_prefill_tokens = 0
             num_decode_tokens = len(seqs)
-        token_ids = llm.model_runner.call("run", seqs, is_prefill)
+        token_ids = llm.model_runner.call("run", seqs, not is_prefill)
         llm.scheduler.postprocess(seqs, token_ids, is_prefill)
     step_end = time.perf_counter()
 
@@ -280,7 +280,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--cudagraph-mode", default="full_and_piecewise", choices=["none", "full_and_piecewise"])
