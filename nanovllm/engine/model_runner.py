@@ -254,14 +254,6 @@ class ModelRunner:
         self.cudagraph_vars[token_bucket] = graph_vars
         return graph_vars
 
-    def set_cudagraph_decode_context(self, graph_vars: dict[str, torch.Tensor]):
-        token_bucket = graph_vars["input_ids"].size(0)
-        set_decode_context(
-            graph_vars["slot_mapping"],
-            graph_vars["cache_seqlens"],
-            graph_vars["block_tables"][:token_bucket],
-        )
-
     def prepare_cudagraph_inputs(self, graph_vars: dict[str, torch.Tensor], input_ids: torch.Tensor, positions: torch.Tensor):
         context = get_context()
         actual_tokens = input_ids.size(0)
@@ -278,23 +270,17 @@ class ModelRunner:
             graph_vars["cache_seqlens"][:actual_tokens].copy_(context.cache_seqlens)
             graph_vars["block_tables"][:actual_tokens, :context.block_tables.size(1)].copy_(context.block_tables)
 
-    def empty_piecewise_buffers(self, token_bucket: int):
-        hf_config = self.config.hf_config
-        attn = self.model.model.layers[0].self_attn
-        return (
-            torch.empty(token_bucket, attn.num_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda"),
-            torch.empty(token_bucket, attn.num_kv_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda"),
-            torch.empty(token_bucket, attn.num_kv_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda"),
-            torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda"),
-        )
-
     def capture_full_decode_graph(self, token_bucket: int, graph_vars: dict[str, torch.Tensor]):
         if token_bucket in self.full_decode_graphs:
             return self.full_decode_graphs[token_bucket]
         hf_config = self.config.hf_config
         output_buf = torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda")
         graph = torch.cuda.CUDAGraph()
-        self.set_cudagraph_decode_context(graph_vars)
+        set_decode_context(
+            graph_vars["slot_mapping"],
+            graph_vars["cache_seqlens"],
+            graph_vars["block_tables"][:token_bucket],
+        )
         hidden_states = self.model(graph_vars["input_ids"], graph_vars["positions"])
         output_buf.copy_(hidden_states)
         with torch.cuda.graph(graph, self.graph_pool):
@@ -310,7 +296,12 @@ class ModelRunner:
         graph_key = ("first_piece", token_bucket)
         if graph_key in self.piecewise_graphs:
             return self.piecewise_graphs[graph_key]
-        q_buf, k_buf, v_buf, residual_buf = self.empty_piecewise_buffers(token_bucket)
+        hf_config = self.config.hf_config
+        attn = self.model.model.layers[0].self_attn
+        q_buf = torch.empty(token_bucket, attn.num_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda")
+        k_buf = torch.empty(token_bucket, attn.num_kv_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda")
+        v_buf = torch.empty(token_bucket, attn.num_kv_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda")
+        residual_buf = torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda")
         graph = torch.cuda.CUDAGraph()
         q, k, v, residual = self.model.model.first_piece(graph_vars["input_ids"], graph_vars["positions"])
         q_buf.copy_(q)
@@ -339,7 +330,10 @@ class ModelRunner:
         residual_input = torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda")
         attn_input.zero_()
         residual_input.zero_()
-        q_buf, k_buf, v_buf, residual_buf = self.empty_piecewise_buffers(token_bucket)
+        q_buf = torch.empty(token_bucket, attn.num_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda")
+        k_buf = torch.empty(token_bucket, attn.num_kv_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda")
+        v_buf = torch.empty(token_bucket, attn.num_kv_heads, attn.head_dim, dtype=hf_config.dtype, device="cuda")
+        residual_buf = torch.empty(token_bucket, hf_config.hidden_size, dtype=hf_config.dtype, device="cuda")
         graph = torch.cuda.CUDAGraph()
         q, k, v, residual = self.model.model.next_piece(layer_idx, attn_input, residual_input, graph_vars["positions"])
         q_buf.copy_(q)
@@ -408,7 +402,11 @@ class ModelRunner:
         try:
             self.prepare_cudagraph_inputs(graph_vars, input_ids, positions)
             graph, hidden_states = self.full_decode_graphs[token_bucket]
-            self.set_cudagraph_decode_context(graph_vars)
+            set_decode_context(
+                graph_vars["slot_mapping"],
+                graph_vars["cache_seqlens"],
+                graph_vars["block_tables"][:token_bucket],
+            )
             graph.replay()
         except Exception as exc:
             set_context_obj(actual_context)
