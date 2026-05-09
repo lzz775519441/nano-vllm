@@ -1,0 +1,37 @@
+import os
+
+from transformers import AutoTokenizer
+
+from nanovllm import LLM, SamplingParams
+
+
+def main():
+    qwen3_8b_path = os.path.expanduser("~/autodl-tmp/huggingface/Qwen3-8B/")
+    path = os.path.join(os.path.dirname(os.path.normpath(qwen3_8b_path)), "Qwen1.5-MoE-A2.7B")
+
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=64)
+    prompts = [
+        "introduce yourself briefly",
+        "write a short Python function that checks whether a number is prime",
+    ]
+    prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for prompt in prompts
+    ]
+    outputs = llm.generate(prompts, sampling_params)
+
+    for prompt, output in zip(prompts, outputs):
+        print("\n")
+        print(f"Prompt: {prompt!r}")
+        print(f"Completion: {output['text']!r}")
+
+
+if __name__ == "__main__":
+    main()

@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_decode_context, set_varlen_context, set_context_obj, get_context, reset_context
@@ -19,6 +20,12 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        if getattr(hf_config, "model_type", None) == "qwen2_moe":
+            if config.tensor_parallel_size != 1:
+                raise NotImplementedError("qwen2_moe currently supports tensor_parallel_size=1 only")
+            if not config.enforce_eager:
+                warnings.warn("qwen2_moe currently runs in eager mode only; forcing enforce_eager=True", RuntimeWarning)
+                config.enforce_eager = True
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -29,7 +36,7 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = self.load_model_class(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.graph_pool = None
@@ -51,6 +58,15 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+
+    @staticmethod
+    def load_model_class(hf_config):
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type == "qwen2_moe":
+            return Qwen2MoeForCausalLM(hf_config)
+        if model_type == "qwen3":
+            return Qwen3ForCausalLM(hf_config)
+        raise NotImplementedError(f"Unsupported model_type: {model_type}")
 
     def exit(self):
         if self.world_size > 1:
