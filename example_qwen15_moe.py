@@ -6,8 +6,8 @@ from nanovllm import LLM, SamplingParams
 
 
 def main():
-    qwen3_8b_path = os.path.expanduser("~/autodl-tmp/huggingface/Qwen3-8B/")
-    path = os.path.join(os.path.dirname(os.path.normpath(qwen3_8b_path)), "Qwen1.5-MoE-A2.7B")
+    path = os.path.expanduser(
+        "~/autodl-tmp/huggingface/Qwen1.5-MoE-A2.7B-Chat/")
 
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
@@ -19,11 +19,13 @@ def main():
     ]
     prompts = [
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            [{
+                "role": "user",
+                "content": prompt
+            }],
             tokenize=False,
             add_generation_prompt=True,
-        )
-        for prompt in prompts
+        ) for prompt in prompts
     ]
     outputs = llm.generate(prompts, sampling_params)
 
