@@ -7,10 +7,17 @@ from nanovllm import LLM, SamplingParams
 
 def main():
     path = os.path.expanduser(
-        "~/autodl-tmp/huggingface/Qwen1.5-MoE-A2.7B-Chat/")
+        "~/autodl-tmp/huggingface/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4/")
 
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(
+        path,
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        max_num_batched_tokens=64,
+        max_model_len=1024,
+        gpu_memory_utilization=0.85,
+    )
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=64)
     prompts = [

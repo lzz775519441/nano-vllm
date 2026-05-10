@@ -5,6 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from nanovllm.layers.gptq import GPTQModelLinear, is_gptq_config
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ColumnParallelLinear, QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
@@ -20,6 +21,7 @@ class Qwen2MoeAttention(nn.Module):
         max_position: int,
         rope_theta: float = 1000000.0,
         qkv_bias: bool = True,
+        quant_config=None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -33,19 +35,26 @@ class Qwen2MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
+        self.quantized = quant_config is not None
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-        )
+        if self.quantized:
+            self.q_proj = GPTQModelLinear(quant_config, hidden_size, self.total_num_heads * self.head_dim, bias=qkv_bias)
+            self.k_proj = GPTQModelLinear(quant_config, hidden_size, self.total_num_kv_heads * self.head_dim, bias=qkv_bias)
+            self.v_proj = GPTQModelLinear(quant_config, hidden_size, self.total_num_kv_heads * self.head_dim, bias=qkv_bias)
+            self.o_proj = GPTQModelLinear(quant_config, self.total_num_heads * self.head_dim, hidden_size, bias=True)
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+            )
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -64,8 +73,13 @@ class Qwen2MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.quantized:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
+        else:
+            qkv = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -92,11 +106,17 @@ class Qwen2MoeMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        quant_config=None,
     ) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False)
+        if quant_config is not None:
+            self.gate_proj = GPTQModelLinear(quant_config, hidden_size, intermediate_size, bias=True)
+            self.up_proj = GPTQModelLinear(quant_config, hidden_size, intermediate_size, bias=True)
+            self.down_proj = GPTQModelLinear(quant_config, intermediate_size, hidden_size, bias=True)
+        else:
+            self.gate_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=False)
+            self.up_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=False)
+            self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False)
         assert hidden_act == "silu"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -114,12 +134,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, "norm_topk_prob", False)
+        quant_config = config if is_gptq_config(config) else None
         self.gate = ReplicatedLinear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList([
             Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size,
                 hidden_act=config.hidden_act,
+                quant_config=quant_config,
             )
             for _ in range(config.num_experts)
         ])
@@ -127,6 +149,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
             hidden_act=config.hidden_act,
+            quant_config=quant_config,
         )
         self.shared_expert_gate = ReplicatedLinear(config.hidden_size, 1, bias=False)
 
@@ -173,6 +196,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             max_position=config.max_position_embeddings,
             rope_theta=getattr(config, "rope_theta", 1000000.0),
             qkv_bias=getattr(config, "attention_bias", True),
+            quant_config=config if is_gptq_config(config) else None,
         )
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
         decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
@@ -188,6 +212,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
+                quant_config=config if is_gptq_config(config) else None,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -262,7 +287,7 @@ class Qwen2MoeModel(nn.Module):
 
 
 class Qwen2MoeForCausalLM(nn.Module):
-    packed_modules_mapping = {
+    qkv_packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
@@ -273,6 +298,8 @@ class Qwen2MoeForCausalLM(nn.Module):
         config,
     ) -> None:
         super().__init__()
+        self.quantized = is_gptq_config(config)
+        self.packed_modules_mapping = {} if self.quantized else self.qkv_packed_modules_mapping
         self.model = Qwen2MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:

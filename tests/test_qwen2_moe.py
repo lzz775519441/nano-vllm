@@ -17,6 +17,13 @@ _HAD_FLASH_ATTN = False
 _DIST_DIR = None
 _OWNS_PROCESS_GROUP = False
 qwen2_moe = None
+_GPTQ_MODULES = [
+    "gptqmodel",
+    "gptqmodel.nn_modules",
+    "gptqmodel.nn_modules.qlinear",
+    "gptqmodel.nn_modules.qlinear.machete",
+    "gptqmodel.nn_modules.qlinear.marlin",
+]
 
 
 def setUpModule():
@@ -88,10 +95,83 @@ def tiny_config(**overrides):
     return SimpleNamespace(**config)
 
 
+def tiny_gptq_config(**overrides):
+    config = tiny_config(
+        num_hidden_layers=1,
+        quantization_config={
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": 128,
+            "desc_act": False,
+            "sym": True,
+        },
+    )
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def clear_fake_gptqmodel():
+    for name in _GPTQ_MODULES:
+        sys.modules.pop(name, None)
+
+
+def install_fake_gptqmodel(machete_error: bool = False, marlin_error: bool = False):
+    clear_fake_gptqmodel()
+    sys.modules["gptqmodel"] = types.ModuleType("gptqmodel")
+    sys.modules["gptqmodel.nn_modules"] = types.ModuleType("gptqmodel.nn_modules")
+    sys.modules["gptqmodel.nn_modules.qlinear"] = types.ModuleType("gptqmodel.nn_modules.qlinear")
+    machete_mod = types.ModuleType("gptqmodel.nn_modules.qlinear.machete")
+    marlin_mod = types.ModuleType("gptqmodel.nn_modules.qlinear.marlin")
+
+    class FakeQuantLinear(torch.nn.Module):
+        def __init__(self, bits, group_size, desc_act, sym, in_features, out_features, bias=False, **kwargs):
+            super().__init__()
+            self.in_features = in_features
+            self.out_features = out_features
+            self.bits = bits
+            self.group_size = group_size
+            self.desc_act = desc_act
+            self.sym = sym
+            self.register_parameter("qweight", torch.nn.Parameter(torch.empty(1, out_features, dtype=torch.int32), requires_grad=False))
+            self.register_parameter("qzeros", torch.nn.Parameter(torch.empty(1, max(1, out_features // 8), dtype=torch.int32), requires_grad=False))
+            self.register_parameter("scales", torch.nn.Parameter(torch.empty(1, out_features), requires_grad=False))
+            self.register_parameter("g_idx", torch.nn.Parameter(torch.empty(in_features, dtype=torch.int32), requires_grad=False))
+            if bias:
+                self.register_buffer("bias", torch.empty(out_features))
+            else:
+                self.bias = None
+            self.post_init_calls = 0
+
+        def post_init(self):
+            self.post_init_calls += 1
+
+        def forward(self, x):
+            return torch.zeros(x.shape[:-1] + (self.out_features,), dtype=x.dtype, device=x.device)
+
+    class FakeMacheteLinear(FakeQuantLinear):
+        def __init__(self, *args, **kwargs):
+            if machete_error:
+                raise RuntimeError("machete unavailable")
+            super().__init__(*args, **kwargs)
+
+    class FakeMarlinLinear(FakeQuantLinear):
+        def __init__(self, *args, **kwargs):
+            if marlin_error:
+                raise RuntimeError("marlin unavailable")
+            super().__init__(*args, **kwargs)
+
+    machete_mod.MacheteLinear = FakeMacheteLinear
+    marlin_mod.MarlinLinear = FakeMarlinLinear
+    sys.modules["gptqmodel.nn_modules.qlinear.machete"] = machete_mod
+    sys.modules["gptqmodel.nn_modules.qlinear.marlin"] = marlin_mod
+
+
 class Qwen2MoeTest(unittest.TestCase):
 
     def tearDown(self):
         reset_context()
+        clear_fake_gptqmodel()
 
     def test_sparse_moe_block_shape_with_and_without_topk_norm(self):
         x = torch.randn(5, 8)
@@ -182,6 +262,68 @@ class Qwen2MoeTest(unittest.TestCase):
         self.assertTrue(torch.equal(model.get_parameter("model.layers.0.mlp.experts.0.gate_proj.weight"), expert_gate))
         self.assertTrue(torch.equal(model.get_parameter("model.layers.0.mlp.experts.0.up_proj.weight"), expert_up))
         self.assertTrue(torch.equal(model.get_parameter("model.layers.0.mlp.shared_expert_gate.weight"), shared_gate))
+
+    def test_gptq_model_uses_independent_quantized_projections(self):
+        install_fake_gptqmodel()
+
+        model = qwen2_moe.Qwen2MoeForCausalLM(tiny_gptq_config())
+        attn = model.model.layers[0].self_attn
+
+        self.assertEqual(model.packed_modules_mapping, {})
+        self.assertTrue(hasattr(attn, "q_proj"))
+        self.assertTrue(hasattr(attn, "k_proj"))
+        self.assertTrue(hasattr(attn, "v_proj"))
+        self.assertFalse(hasattr(attn, "qkv_proj"))
+        self.assertTrue(getattr(attn.q_proj, "is_gptq_linear", False))
+        self.assertTrue(getattr(model.model.layers[0].mlp.experts[0].gate_proj, "is_gptq_linear", False))
+        self.assertFalse(getattr(model.model.layers[0].mlp.gate, "is_gptq_linear", False))
+        self.assertFalse(getattr(model.model.layers[0].mlp.shared_expert_gate, "is_gptq_linear", False))
+
+    def test_gptq_loader_loads_quant_tensors_and_runs_post_init(self):
+        try:
+            from safetensors.torch import save_file
+        except ImportError:
+            self.skipTest("safetensors is not installed")
+        from nanovllm.utils.loader import load_model
+
+        install_fake_gptqmodel()
+        model = qwen2_moe.Qwen2MoeForCausalLM(tiny_gptq_config())
+        qweight = torch.full_like(model.get_parameter("model.layers.0.self_attn.q_proj.qweight"), 7)
+        qzeros = torch.full_like(model.get_parameter("model.layers.0.self_attn.q_proj.qzeros"), 3)
+        scales = torch.full_like(model.get_parameter("model.layers.0.self_attn.q_proj.scales"), 0.5)
+        g_idx = torch.arange(model.get_parameter("model.layers.0.self_attn.q_proj.g_idx").numel(), dtype=torch.int32)
+        bias = torch.full_like(model.get_buffer("model.layers.0.self_attn.q_proj.bias"), 2.0)
+        expert_qweight = torch.full_like(model.get_parameter("model.layers.0.mlp.experts.0.gate_proj.qweight"), 9)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_file(
+                {
+                    "model.layers.0.self_attn.q_proj.qweight": qweight,
+                    "model.layers.0.self_attn.q_proj.qzeros": qzeros,
+                    "model.layers.0.self_attn.q_proj.scales": scales,
+                    "model.layers.0.self_attn.q_proj.g_idx": g_idx,
+                    "model.layers.0.self_attn.q_proj.bias": bias,
+                    "model.layers.0.mlp.experts.0.gate_proj.qweight": expert_qweight,
+                },
+                os.path.join(tmpdir, "model.safetensors"),
+            )
+            load_model(model, tmpdir)
+
+        self.assertTrue(torch.equal(model.get_parameter("model.layers.0.self_attn.q_proj.qweight"), qweight))
+        self.assertTrue(torch.equal(model.get_parameter("model.layers.0.self_attn.q_proj.qzeros"), qzeros))
+        self.assertTrue(torch.equal(model.get_parameter("model.layers.0.self_attn.q_proj.scales"), scales))
+        self.assertTrue(torch.equal(model.get_parameter("model.layers.0.self_attn.q_proj.g_idx"), g_idx))
+        self.assertTrue(torch.equal(model.get_buffer("model.layers.0.self_attn.q_proj.bias"), bias))
+        self.assertTrue(torch.equal(model.get_parameter("model.layers.0.mlp.experts.0.gate_proj.qweight"), expert_qweight))
+        gptq_modules = [module for module in model.modules() if getattr(module, "is_gptq_linear", False)]
+        self.assertGreater(len(gptq_modules), 0)
+        self.assertTrue(all(module.post_init_calls == 1 for module in gptq_modules))
+
+    def test_gptq_fused_backend_failure_does_not_fallback_to_fp16(self):
+        install_fake_gptqmodel(machete_error=True, marlin_error=True)
+
+        with self.assertRaisesRegex(RuntimeError, "will not fall back"):
+            qwen2_moe.Qwen2MoeForCausalLM(tiny_gptq_config())
 
 
 if __name__ == "__main__":
