@@ -325,6 +325,22 @@ class Qwen2MoeTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "will not fall back"):
             qwen2_moe.Qwen2MoeForCausalLM(tiny_gptq_config())
 
+    def test_gptq_prefers_marlin_on_non_sm90_gpu(self):
+        install_fake_gptqmodel()
+        from nanovllm.layers import gptq
+
+        old_is_available = torch.cuda.is_available
+        old_get_device_capability = torch.cuda.get_device_capability
+        torch.cuda.is_available = lambda: True
+        torch.cuda.get_device_capability = lambda: (12, 0)
+        try:
+            linear = gptq.GPTQModelLinear(tiny_gptq_config(), 64, 128)
+        finally:
+            torch.cuda.is_available = old_is_available
+            torch.cuda.get_device_capability = old_get_device_capability
+
+        self.assertEqual(linear.gptq_backend, "marlin")
+
 
 if __name__ == "__main__":
     unittest.main()

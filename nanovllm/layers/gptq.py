@@ -68,10 +68,19 @@ def _make_backend_linear(backend_name: str, quant_config: dict, config, input_si
     return linear
 
 
+def _backend_order() -> tuple[str, ...]:
+    if not torch.cuda.is_available():
+        return ("marlin", "machete")
+    major, _ = torch.cuda.get_device_capability()
+    if major == 9:
+        return ("machete", "marlin")
+    return ("marlin", "machete")
+
+
 def GPTQModelLinear(config, input_size: int, output_size: int, bias: bool = True) -> nn.Module:
     quant_config = get_quant_config(config)
     errors = []
-    for backend_name in ("machete", "marlin"):
+    for backend_name in _backend_order():
         try:
             return _make_backend_linear(backend_name, quant_config, config, input_size, output_size, bias)
         except Exception as exc:
@@ -92,5 +101,12 @@ def post_init_gptq_modules(model: nn.Module):
             continue
         post_init = getattr(module, "post_init", None)
         if post_init is not None:
-            post_init()
+            try:
+                post_init()
+            except Exception as exc:
+                backend = getattr(module, "gptq_backend", "unknown")
+                raise RuntimeError(
+                    f"GPTQModel {backend} post_init failed. This backend may not support the current GPU "
+                    "or PyTorch/GPTQModel build. nano-vLLM will not fall back to bf16/fp16 dequantized weights."
+                ) from exc
         module.gptq_post_init_done = True
