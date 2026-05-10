@@ -1,5 +1,4 @@
 import pickle
-import warnings
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -10,7 +9,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_decode_context, set_varlen_context, set_context_obj, get_context, reset_context
+from nanovllm.utils.context import set_decode_context, set_varlen_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
@@ -20,12 +19,6 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        if getattr(hf_config, "model_type", None) == "qwen2_moe":
-            if config.tensor_parallel_size != 1:
-                raise NotImplementedError("qwen2_moe currently supports tensor_parallel_size=1 only")
-            if not config.enforce_eager:
-                warnings.warn("qwen2_moe currently runs in eager mode only; forcing enforce_eager=True", RuntimeWarning)
-                config.enforce_eager = True
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -398,82 +391,45 @@ class ModelRunner:
             self.capture_next_piece_graph(token_bucket, layer_idx, graph_vars)
         self.capture_last_piece_graph(token_bucket, num_layers - 1, graph_vars)
 
-    def has_piecewise_graphs(self, token_bucket: int) -> bool:
-        if not hasattr(self, 'piecewise_graphs'):
-            return False
-        num_layers = len(self.model.model.layers)
-        if ("first_piece", token_bucket) not in self.piecewise_graphs:
-            return False
-        for layer_idx in range(num_layers - 1):
-            if ("next_piece", layer_idx, token_bucket) not in self.piecewise_graphs:
-                return False
-        return ("last_piece", num_layers - 1, token_bucket) in self.piecewise_graphs
-
     def run_full_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        actual_context = get_context()
         token_bucket = self._round_bucket(input_ids.size(0))
-        if token_bucket not in self.full_decode_graphs:
-            return None
         graph_vars = self.cudagraph_vars[token_bucket]
-        try:
-            self.prepare_cudagraph_inputs(graph_vars, input_ids, positions)
-            graph, hidden_states = self.full_decode_graphs[token_bucket]
-            set_decode_context(
-                graph_vars["slot_mapping"],
-                graph_vars["cache_seqlens"],
-                graph_vars["block_tables"][:token_bucket],
-            )
-            graph.replay()
-        except Exception as exc:
-            set_context_obj(actual_context)
-            if isinstance(exc, torch.cuda.OutOfMemoryError):
-                self.full_decode_graphs.pop(token_bucket, None)
-                torch.cuda.empty_cache()
-            warnings.warn(f"Full decode CUDA graph disabled for token_bucket={token_bucket}: {exc}", RuntimeWarning)
-            return None
+        self.prepare_cudagraph_inputs(graph_vars, input_ids, positions)
+        graph, hidden_states = self.full_decode_graphs[token_bucket]
+        set_decode_context(
+            graph_vars["slot_mapping"],
+            graph_vars["cache_seqlens"],
+            graph_vars["block_tables"][:token_bucket],
+        )
+        graph.replay()
         return hidden_states
 
     def run_piecewise_graph(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        actual_context = get_context()
         actual_tokens = input_ids.size(0)
         token_bucket = self._round_bucket(actual_tokens)
-        if not self.has_piecewise_graphs(token_bucket):
-            return None
         graph_vars = self.cudagraph_vars[token_bucket]
-        try:
-            self.prepare_cudagraph_inputs(graph_vars, input_ids, positions)
-            graph, outputs = self.piecewise_graphs[("first_piece", token_bucket)]
-            graph.replay()
-            q, k, v, residual = outputs
-            num_layers = len(self.model.model.layers)
-            for layer_idx, layer in enumerate(self.model.model.layers):
-                attn_output = layer.attention(q[:actual_tokens], k[:actual_tokens], v[:actual_tokens])
-                if layer_idx == num_layers - 1:
-                    graph, attn_input, residual_input, hidden_states = self.piecewise_graphs[("last_piece", layer_idx, token_bucket)]
-                    attn_input.zero_()
-                    residual_input.zero_()
-                    attn_input[:actual_tokens].copy_(attn_output)
-                    residual_input[:actual_tokens].copy_(residual[:actual_tokens])
-                    graph.replay()
-                else:
-                    graph, attn_input, residual_input, outputs = self.piecewise_graphs[("next_piece", layer_idx, token_bucket)]
-                    attn_input.zero_()
-                    residual_input.zero_()
-                    attn_input[:actual_tokens].copy_(attn_output)
-                    residual_input[:actual_tokens].copy_(residual[:actual_tokens])
-                    graph.replay()
-                    q, k, v, residual = outputs
-        except Exception as exc:
-            set_context_obj(actual_context)
-            if isinstance(exc, torch.cuda.OutOfMemoryError):
-                graph_keys = [graph_key for graph_key in self.piecewise_graphs if graph_key[-1] == token_bucket]
-                for graph_key in graph_keys:
-                    del self.piecewise_graphs[graph_key]
-                self.full_decode_graphs.pop(token_bucket, None)
-                self.cudagraph_vars.pop(token_bucket, None)
-                torch.cuda.empty_cache()
-            warnings.warn(f"Piecewise CUDA graph disabled for token_bucket={token_bucket}: {exc}", RuntimeWarning)
-            return None
+        self.prepare_cudagraph_inputs(graph_vars, input_ids, positions)
+        graph, outputs = self.piecewise_graphs[("first_piece", token_bucket)]
+        graph.replay()
+        q, k, v, residual = outputs
+        num_layers = len(self.model.model.layers)
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            attn_output = layer.attention(q[:actual_tokens], k[:actual_tokens], v[:actual_tokens])
+            if layer_idx == num_layers - 1:
+                graph, attn_input, residual_input, hidden_states = self.piecewise_graphs[("last_piece", layer_idx, token_bucket)]
+                attn_input.zero_()
+                residual_input.zero_()
+                attn_input[:actual_tokens].copy_(attn_output)
+                residual_input[:actual_tokens].copy_(residual[:actual_tokens])
+                graph.replay()
+            else:
+                graph, attn_input, residual_input, outputs = self.piecewise_graphs[("next_piece", layer_idx, token_bucket)]
+                attn_input.zero_()
+                residual_input.zero_()
+                attn_input[:actual_tokens].copy_(attn_output)
+                residual_input[:actual_tokens].copy_(residual[:actual_tokens])
+                graph.replay()
+                q, k, v, residual = outputs
         return hidden_states
 
     @torch.inference_mode()
@@ -482,12 +438,8 @@ class ModelRunner:
             hidden_states = self.model(input_ids, positions)
         elif is_decode:
             hidden_states = self.run_full_decode_graph(input_ids, positions)
-            if hidden_states is None:
-                hidden_states = self.model(input_ids, positions)
         else:
             hidden_states = self.run_piecewise_graph(input_ids, positions)
-            if hidden_states is None:
-                hidden_states = self.model(input_ids, positions)
 
         if sample_indices.numel() == 0:
             return None
@@ -512,25 +464,8 @@ class ModelRunner:
         self.cudagraph_vars = {}
         for token_bucket in self.get_cudagraph_capture_sizes(self.config.max_decode_cudagraph_tokens):
             graph_vars = self.get_cudagraph_vars(token_bucket)
-            try:
-                self.capture_full_decode_graph(token_bucket, graph_vars)
-            except torch.cuda.OutOfMemoryError:
-                self.full_decode_graphs.pop(token_bucket, None)
-                self.cudagraph_vars.pop(token_bucket, None)
-                torch.cuda.empty_cache()
-                warnings.warn(f"Full decode CUDA graph capture stopped at token_bucket={token_bucket}: out of memory", RuntimeWarning)
-                break
+            self.capture_full_decode_graph(token_bucket, graph_vars)
 
         for token_bucket in self.get_cudagraph_capture_sizes(self.config.max_piecewise_cudagraph_tokens):
             graph_vars = self.get_cudagraph_vars(token_bucket)
-            try:
-                self.capture_piecewise_graphs(token_bucket, graph_vars)
-            except torch.cuda.OutOfMemoryError:
-                graph_keys = [graph_key for graph_key in self.piecewise_graphs if graph_key[-1] == token_bucket]
-                for graph_key in graph_keys:
-                    del self.piecewise_graphs[graph_key]
-                if token_bucket not in self.full_decode_graphs:
-                    self.cudagraph_vars.pop(token_bucket, None)
-                torch.cuda.empty_cache()
-                warnings.warn(f"Piecewise CUDA graph capture stopped at token_bucket={token_bucket}: out of memory", RuntimeWarning)
-                break
+            self.capture_piecewise_graphs(token_bucket, graph_vars)

@@ -4,18 +4,25 @@ import torch
 from torch import nn
 from safetensors import safe_open
 
-from nanovllm.layers.gptq import post_init_gptq_modules
-
 
 def default_weight_loader(param: nn.Parameter | torch.Tensor, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
 def get_parameter_or_buffer(model: nn.Module, name: str) -> nn.Parameter | torch.Tensor:
-    try:
-        return model.get_parameter(name)
-    except AttributeError:
-        return model.get_buffer(name)
+    parameters = dict(model.named_parameters())
+    if name in parameters:
+        return parameters[name]
+    return dict(model.named_buffers())[name]
+
+
+def post_init_gptq_modules(model: nn.Module):
+    from gptqmodel.nn_modules.qlinear.marlin import MarlinLinear
+
+    for module in model.modules():
+        if not isinstance(module, MarlinLinear):
+            continue
+        module.post_init()
 
 
 def load_model(model: nn.Module, path: str):
