@@ -174,7 +174,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters["rope_theta"],
             config=config,
         )
         self.mlp = Qwen2MoeSparseMoeBlock(config)
