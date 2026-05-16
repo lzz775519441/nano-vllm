@@ -9,7 +9,7 @@ try:
 except ImportError:
     flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
-from nanovllm.utils.context import get_context
+from myvllm.utils.context import get_context
 
 
 @triton.jit

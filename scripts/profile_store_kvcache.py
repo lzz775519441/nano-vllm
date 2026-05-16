@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanovllm.layers.attention import (
+from myvllm.layers.attention import (
     store_kvcache_torch,
     store_kvcache_torch_compile,
     store_kvcache_triton,
@@ -37,7 +37,7 @@ DTYPES = {
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Profile nanovllm store_kvcache backends.")
+    parser = argparse.ArgumentParser(description="Profile myvllm store_kvcache backends.")
     parser.add_argument("--backend", choices=sorted(BACKENDS), required=True)
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--num-kv-heads", type=int, default=8)

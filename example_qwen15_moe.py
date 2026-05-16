@@ -50,7 +50,7 @@ def main():
     args = parse_args()
     path = os.path.expanduser(args.model)
 
-    from nanovllm import LLM, SamplingParams
+    from myvllm import LLM, SamplingParams
 
     nvtx_push("tokenizer_load")
     tokenizer = AutoTokenizer.from_pretrained(path)

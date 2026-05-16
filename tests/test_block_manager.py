@@ -1,7 +1,7 @@
 import unittest
 
-from nanovllm.engine.block_manager import BlockManager
-from nanovllm.engine.sequence import Sequence
+from myvllm.engine.block_manager import BlockManager
+from myvllm.engine.sequence import Sequence
 
 
 class BlockManagerTest(unittest.TestCase):

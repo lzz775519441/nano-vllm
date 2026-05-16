@@ -4,13 +4,13 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen2_moe import Qwen2MoeForCausalLM
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_decode_context, set_varlen_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from myvllm.config import Config
+from myvllm.engine.sequence import Sequence
+from myvllm.models.qwen2_moe import Qwen2MoeForCausalLM
+from myvllm.models.qwen3 import Qwen3ForCausalLM
+from myvllm.layers.sampler import Sampler
+from myvllm.utils.context import set_decode_context, set_varlen_context, get_context, reset_context
+from myvllm.utils.loader import load_model
 
 
 class ModelRunner:
@@ -45,11 +45,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name="myvllm", create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name="myvllm")
                 self.loop()
 
     @staticmethod

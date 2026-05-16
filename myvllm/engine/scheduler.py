@@ -1,9 +1,9 @@
 from collections import deque
 from dataclasses import dataclass
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
+from myvllm.config import Config
+from myvllm.engine.sequence import Sequence, SequenceStatus
+from myvllm.engine.block_manager import BlockManager
 
 
 @dataclass(slots=True)

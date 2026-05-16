@@ -40,7 +40,7 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 def build_requests(args, num_requests: int):
-    from nanovllm import SamplingParams
+    from myvllm import SamplingParams
 
     prompt_token_ids = [
         [random.randint(0, args.vocab_range) for _ in range(sample_length(args.min_input_len, args.max_input_len, args.length_distribution))]
@@ -88,7 +88,7 @@ def build_online_workload(args):
 
 
 def make_llm(args):
-    from nanovllm import LLM
+    from myvllm import LLM
 
     return LLM(
         os.path.expanduser(args.model),
@@ -104,7 +104,7 @@ def make_llm(args):
 
 
 def warmup(llm):
-    from nanovllm import SamplingParams
+    from myvllm import SamplingParams
 
     llm.generate(["Benchmark: "], SamplingParams(), use_tqdm=False)
     torch.cuda.synchronize()
@@ -247,7 +247,7 @@ def run_online(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="nano-vLLM offline and online benchmark")
+    parser = argparse.ArgumentParser(description="my-vLLM offline and online benchmark")
     parser.add_argument("--mode", choices=["online", "offline"], default="online")
     parser.add_argument("--model", default="~/autodl-tmp/huggingface/Qwen3-8B/")
     parser.add_argument("--num-seqs", type=int, default=256, help="Number of requests when --duration is 0, or burst size when --duration > 0 and --request-rate is 0.")

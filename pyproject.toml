@@ -3,10 +3,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
-license = { file = "LICENSE" }
+name = "my-vLLM"
+version = "1.2.0"
 readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
@@ -21,8 +19,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/lzz775519441/my-vLLM"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nanovllm*"]
+include = ["myvllm*"]

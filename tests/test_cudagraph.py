@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from nanovllm.utils.context import reset_context, set_decode_context, set_varlen_context
+from myvllm.utils.context import reset_context, set_decode_context, set_varlen_context
 
 
 class AttentionModeTest(unittest.TestCase):
@@ -25,12 +25,12 @@ class AttentionModeTest(unittest.TestCase):
         fake_flash_attn.flash_attn_varlen_func = fake_varlen
         fake_flash_attn.flash_attn_with_kvcache = fake_kvcache
         sys.modules["flash_attn"] = fake_flash_attn
-        sys.modules.pop("nanovllm.layers.attention", None)
-        self.attention_mod = importlib.import_module("nanovllm.layers.attention")
+        sys.modules.pop("myvllm.layers.attention", None)
+        self.attention_mod = importlib.import_module("myvllm.layers.attention")
 
     def tearDown(self):
         reset_context()
-        sys.modules.pop("nanovllm.layers.attention", None)
+        sys.modules.pop("myvllm.layers.attention", None)
         sys.modules.pop("flash_attn", None)
 
     def test_varlen_context_uses_varlen_attention(self):

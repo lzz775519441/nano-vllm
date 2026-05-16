@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-from nanovllm.utils.context import reset_context, set_varlen_context
+from myvllm.utils.context import reset_context, set_varlen_context
 
 
 _OLD_FLASH_ATTN = None
@@ -41,8 +41,8 @@ def setUpModule():
     fake_flash_attn.flash_attn_varlen_func = fake_varlen
     fake_flash_attn.flash_attn_with_kvcache = fake_kvcache
     sys.modules["flash_attn"] = fake_flash_attn
-    sys.modules.pop("nanovllm.layers.attention", None)
-    sys.modules.pop("nanovllm.models.qwen2_moe", None)
+    sys.modules.pop("myvllm.layers.attention", None)
+    sys.modules.pop("myvllm.models.qwen2_moe", None)
 
     if dist.is_available() and not dist.is_initialized():
         _DIST_DIR = tempfile.TemporaryDirectory()
@@ -51,13 +51,13 @@ def setUpModule():
         _OWNS_PROCESS_GROUP = True
 
     install_fake_gptqmodel()
-    qwen2_moe = importlib.import_module("nanovllm.models.qwen2_moe")
+    qwen2_moe = importlib.import_module("myvllm.models.qwen2_moe")
 
 
 def tearDownModule():
     reset_context()
-    sys.modules.pop("nanovllm.models.qwen2_moe", None)
-    sys.modules.pop("nanovllm.layers.attention", None)
+    sys.modules.pop("myvllm.models.qwen2_moe", None)
+    sys.modules.pop("myvllm.layers.attention", None)
     if _HAD_FLASH_ATTN:
         sys.modules["flash_attn"] = _OLD_FLASH_ATTN
     else:
@@ -205,7 +205,7 @@ class Qwen2MoeTest(unittest.TestCase):
 
     def test_gptq_loader_loads_quant_tensors_and_runs_post_init(self):
         from safetensors.torch import save_file
-        from nanovllm.utils.loader import load_model
+        from myvllm.utils.loader import load_model
 
         install_fake_gptqmodel()
         model = qwen2_moe.Qwen2MoeForCausalLM(tiny_config(num_hidden_layers=1))

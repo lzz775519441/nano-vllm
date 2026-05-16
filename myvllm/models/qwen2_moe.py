@@ -4,11 +4,11 @@ from torch import nn
 import torch.distributed as dist
 from gptqmodel.nn_modules.qlinear.marlin import MarlinLinear
 
-from nanovllm.layers.attention import Attention
-from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import ReplicatedLinear
-from nanovllm.layers.rotary_embedding import get_rope
+from myvllm.layers.attention import Attention
+from myvllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from myvllm.layers.layernorm import RMSNorm
+from myvllm.layers.linear import ReplicatedLinear
+from myvllm.layers.rotary_embedding import get_rope
 
 
 class Qwen2MoeAttention(nn.Module):

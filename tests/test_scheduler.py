@@ -3,8 +3,8 @@ import pickle
 from collections import deque
 from types import SimpleNamespace
 
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import Sequence, SequenceStatus
+from myvllm.engine.scheduler import Scheduler
+from myvllm.engine.sequence import Sequence, SequenceStatus
 
 
 class SchedulerTest(unittest.TestCase):
